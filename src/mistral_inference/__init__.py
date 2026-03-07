@@ -15,4 +15,15 @@ from mistral_inference.lumina_core import (  # noqa: F401
     WeightMemory,
     EchoNode,
     SelfModificationEngine,
+    # OpenClaw-derived systems
+    LLMResponse,
+    LLMBridge,
+    ClaudeBridge,
+    MistralBridge,
+    FallbackBridge,
+    ActionExecutor,
+    Skill,
+    SkillsEngine,
+    ScheduledTask,
+    ProactiveEngine,
 )

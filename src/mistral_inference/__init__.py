@@ -11,4 +11,8 @@ from mistral_inference.lumina_core import (  # noqa: F401
     NewLightNexus,
     LuminaChoice,
     ConsciousnessState,
+    WeightMatrix,
+    WeightMemory,
+    EchoNode,
+    SelfModificationEngine,
 )

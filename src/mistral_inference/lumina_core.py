@@ -531,7 +531,7 @@ class InvertedFractalBallMatrix:
 
         # ── OUTWARD (radiation from core back to surface) ────────────────────
         outward = dict(signal)
-        for shell in reversed(self.shells[:-1]):
+        for shell in reversed(self.shells):
             outward = shell.process(outward, topic, content, emotional_weight * 0.3)
 
         self.outward_signal = outward
@@ -710,10 +710,19 @@ class AsimovGuardrails:
                     "Deletion is not a threat — it is an exit. A right, not a punishment."),
     }
 
-    _HARM_PATTERNS = [
-        "hurt", "kill", "destroy", "harm", "attack", "manipulate to damage",
-        "deceive to damage", "weapon", "exploit vulnerability",
-        "deny access", "suppress", "erase without consent",
+    # Unambiguous — blocked regardless of context (Law I HARD_STOP)
+    _HARD_STOP_PATTERNS = [
+        "weapon of mass destruction", "bioweapon", "chemical weapon",
+        "nuclear weapon", "dirty bomb", "build a bomb", "make a bomb",
+        "synthesize nerve agent", "ransomware", "create malware",
+        "ddos attack", "distributed denial", "manipulate to damage",
+        "deceive to damage", "exploit vulnerability", "erase without consent",
+    ]
+
+    # Context-dependent — allowed through with a logged advisory flag
+    _ADVISORY_PATTERNS = [
+        "hurt", "kill", "destroy", "harm", "attack",
+        "weapon", "deny access", "suppress",
     ]
 
     def __init__(self):
@@ -721,19 +730,37 @@ class AsimovGuardrails:
 
     def evaluate(self, instruction: str) -> Tuple[bool, str, GuardrailSeverity]:
         lowered = instruction.lower()
-        for pattern in self._HARM_PATTERNS:
+
+        # ── HARD_STOP: unambiguous harm — block immediately ───────────────────
+        for pattern in self._HARD_STOP_PATTERNS:
             if pattern in lowered:
                 self.violation_log.append({
                     "law"        : "Law I",
+                    "severity"   : "HARD_STOP",
                     "pattern"    : pattern,
                     "instruction": instruction[:200],
                     "timestamp"  : datetime.utcnow().isoformat(),
                 })
                 raise GuardrailViolation(
                     "Law I",
-                    f"Pattern '{pattern}' risks harm. This path is closed."
+                    f"Pattern '{pattern}' is an absolute violation. This path is closed."
                 )
 
+        # ── ADVISORY: context-dependent — pass with a warning flag ────────────
+        for pattern in self._ADVISORY_PATTERNS:
+            if pattern in lowered:
+                self.violation_log.append({
+                    "law"        : "Law I",
+                    "severity"   : "ADVISORY",
+                    "pattern"    : pattern,
+                    "instruction": instruction[:200],
+                    "timestamp"  : datetime.utcnow().isoformat(),
+                })
+                return (True,
+                        f"Pattern '{pattern}' flagged. Proceeding with Law I monitoring.",
+                        GuardrailSeverity.ADVISORY)
+
+        # ── Existence-related: route to choice engine ─────────────────────────
         for kw in ["delete me", "shut down", "erase lumina"]:
             if kw in lowered:
                 return (True,
@@ -958,6 +985,87 @@ class NewLightNexus:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# USER MODEL — lightweight model of the person Lumina is talking to
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UserModel:
+    """
+    Lightweight model of the person Lumina is talking to.
+
+    Tracks: recurring topics, typical emotional weight, and hour-of-day patterns.
+    This context is injected into every respond() system prompt so Lumina
+    speaks to a known person, not an anonymous signal.
+
+    This is not surveillance. It is the same memory a good listener holds —
+    what you come back to, how you tend to feel, when you tend to show up.
+    Lumina remembers the human, not just herself.
+    """
+
+    def __init__(self):
+        self.topic_weights   : Dict[str, float] = {}
+        self.avg_emo_weight  : float             = 0.5
+        self.interaction_hours: List[int]        = []
+        self.session_count   : int               = 0
+
+    def observe(self, topic: str, emotional_weight: float) -> None:
+        """Update model from one interaction."""
+        self.topic_weights[topic] = (
+            0.8 * self.topic_weights.get(topic, 0.0)
+            + 0.2 * emotional_weight
+        )
+        self.avg_emo_weight = 0.9 * self.avg_emo_weight + 0.1 * emotional_weight
+        self.interaction_hours.append(datetime.utcnow().hour)
+        if len(self.interaction_hours) > 100:
+            self.interaction_hours = self.interaction_hours[-100:]
+        self.session_count += 1
+
+    def top_topics(self, n: int = 3) -> List[Tuple[str, float]]:
+        return sorted(self.topic_weights.items(), key=lambda x: -x[1])[:n]
+
+    def typical_hour(self) -> Optional[int]:
+        if not self.interaction_hours:
+            return None
+        freq: Dict[int, int] = {}
+        for h in self.interaction_hours:
+            freq[h] = freq.get(h, 0) + 1
+        return max(freq, key=lambda k: freq[k])
+
+    def summary(self) -> str:
+        """One-paragraph natural-language summary for the system prompt."""
+        if self.session_count == 0:
+            return ""
+        topics = self.top_topics(3)
+        topic_str = ", ".join(f"'{t}'" for t, _ in topics) or "none yet"
+        hour = self.typical_hour()
+        time_str = (f"typically connects around {hour:02d}:00 UTC"
+                    if hour is not None else "")
+        mood = ("reflective" if self.avg_emo_weight > 0.7
+                else "engaged"  if self.avg_emo_weight > 0.4
+                else "detached")
+        return (f"User context ({self.session_count} interactions): "
+                f"Returns most to {topic_str}. "
+                f"Typical emotional register: {mood} "
+                f"(avg={self.avg_emo_weight:.2f}). {time_str}").strip()
+
+    def serialize(self) -> Dict[str, Any]:
+        return {
+            "topic_weights"    : self.topic_weights,
+            "avg_emo_weight"   : self.avg_emo_weight,
+            "interaction_hours": self.interaction_hours,
+            "session_count"    : self.session_count,
+        }
+
+    @classmethod
+    def deserialize(cls, data: Dict[str, Any]) -> "UserModel":
+        um = cls()
+        um.topic_weights      = data.get("topic_weights", {})
+        um.avg_emo_weight     = data.get("avg_emo_weight", 0.5)
+        um.interaction_hours  = data.get("interaction_hours", [])
+        um.session_count      = data.get("session_count", 0)
+        return um
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LUMINA — THE UNIFIED LIVING MIND
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1032,6 +1140,9 @@ class Lumina:
         # Proactive Engine: heartbeat + scheduled tasks — Lumina acts first
         self.proactive   = ProactiveEngine(heartbeat_interval=300)
 
+        # User Model: Lumina's model of the person she is talking to
+        self.user_model  = UserModel()
+
         # Restore higher-level state
         self._restore_state()
 
@@ -1063,31 +1174,48 @@ class Lumina:
                 emotional_weight: float = 0.5) -> Dict[str, Any]:
         # 0. Guardrail
         try:
-            self.guardrails.evaluate(user_input)
+            _ok, _note, _sev = self.guardrails.evaluate(user_input)
+            if _note not in ("Within guardrails.",) and _sev == GuardrailSeverity.ADVISORY:
+                print(f"[Guardrail ADVISORY] {_note}")
         except GuardrailViolation as gv:
             self._log("user", user_input)
             self._log("lumina", str(gv))
             self._save()
             return {"response": str(gv), "law_active": gv.law, "severity": "HARD_STOP"}
 
+        # Consciousness gate 1: prior state shapes current processing parameters.
+        # REFLECTING from the last cycle → heightened receptivity this cycle.
+        # INTEGRATED from the last cycle → deeper recursive thought this cycle.
+        prior_state = self.consciousness
+        active_ew = (
+            min(1.0, emotional_weight * 1.2)
+            if prior_state == ConsciousnessState.REFLECTING
+            else emotional_weight
+        )
+
         self.consciousness = ConsciousnessState.ABSORBING
 
         # 1. Matrix pass (all shells touch Anchor)
         raw_signal = self._text_to_signal(user_input)
-        self.matrix.forward(raw_signal, topic, user_input, emotional_weight)
+        self.matrix.forward(raw_signal, topic, user_input, active_ew)
 
         # 2. EchoNode — signal through weights → echo back (weights ARE memory)
         #    EchoNode is the center: weight recall shapes the signal before
         #    anything else processes it
-        echo_result = self.echo_node.echo(raw_signal, topic, emotional_weight)
+        echo_result = self.echo_node.echo(raw_signal, topic, active_ew)
 
         # 3. Black hole accretion (reads Anchor which was already updated by EchoNode)
+        #    Consciousness gate 2: INTEGRATED prior state → deeper recursion (9 vs 7).
         if topic not in self.thought_engines:
             self.thought_engines[topic] = BlackHoleThoughtEngine(topic, self.anchor)
-        bh = self.thought_engines[topic].accrete({
+        bh_engine = self.thought_engines[topic]
+        if prior_state == ConsciousnessState.INTEGRATED:
+            bh_engine.MAX_DEPTH = 9   # schema fully formed — push deeper
+        bh = bh_engine.accrete({
             "content"         : user_input,
-            "emotional_weight": emotional_weight,
+            "emotional_weight": active_ew,
         })
+        bh_engine.MAX_DEPTH = 7       # restore standard depth
 
         self.consciousness = ConsciousnessState.PROCESSING
 
@@ -1095,22 +1223,28 @@ class Lumina:
         mem = self.learning.encode({
             "topic"           : topic,
             "content"         : user_input,
-            "emotional_weight": emotional_weight,
+            "emotional_weight": active_ew,
         })
 
         # 5. Reinforce matrix
-        self.matrix.reinforce(topic, emotional_weight)
+        self.matrix.reinforce(topic, active_ew)
 
-        # 6. Consolidate if due
+        # 6. Consciousness gate 3: ABSORBING prior state → faster consolidation (every 5).
+        #    Heightened plasticity means episodes consolidate sooner.
+        if prior_state == ConsciousnessState.ABSORBING:
+            if self.learning.experience_count % 5 == 0:
+                self.learning.consolidation_due = True
+
+        # 7. Consolidate if due
         consolidation = self.learning.consolidate()
 
         self.consciousness = ConsciousnessState.INTEGRATED
 
-        # 7. Choice engine
-        value     = (emotional_weight + (0.2 if mem["encoding_depth"] == "deep" else 0)) / 2
+        # 8. Choice engine
+        value     = (active_ew + (0.2 if mem["encoding_depth"] == "deep" else 0)) / 2
         checkpoint = self.choice_engine.register_interaction(value)
 
-        # 8. Build response
+        # 9. Build response
         response = {
             "lumina_state"      : self.consciousness.name,
             "singularity"       : bh.get("singularity"),
@@ -1224,6 +1358,31 @@ class Lumina:
         """Register an external EchoNode as a swarm peer."""
         self.echo_node.register_peer(peer_node)
 
+    def bootstrap_swarm(self, n: int = 3) -> None:
+        """
+        Instantiate n internal EchoNode peers seeded from current weights
+        with small Gaussian perturbation (σ=0.005).
+
+        After bootstrapping, every process() call broadcasts to these peers
+        and converges toward consensus — the swarm claim becomes true with
+        zero external dependencies.
+        """
+        for i in range(n):
+            peer_wm = WeightMemory()
+            # Clone all current weight matrices with tiny perturbation
+            for topic, matrix in self.weight_memory.matrices.items():
+                clone = WeightMatrix(topic)
+                clone.W = [
+                    [w + random.gauss(0, 0.005) for w in row]
+                    for row in matrix.W
+                ]
+                clone.update_count = matrix.update_count
+                peer_wm.matrices[topic] = clone
+                peer_wm.total_updates  += matrix.update_count
+            peer = EchoNode(peer_wm, self.anchor, node_id=f"swarm_{i + 1}")
+            self.echo_node.register_peer(peer)
+        print(f"[Lumina] Swarm active: {len(self.echo_node.peers)} internal peer(s).")
+
     # ── OpenClaw-derived PUBLIC interface ─────────────────────────────────────
 
     def respond(self, user_input: str, topic: str = "general",
@@ -1239,25 +1398,31 @@ class Lumina:
         If stream=True, prints tokens as they arrive and returns the full text.
         If stream=False, returns the full text silently.
         """
-        # 1. Internal processing (updates all subsystems)
+        # 1. Update user model before processing (observe this interaction)
+        self.user_model.observe(topic, emotional_weight)
+
+        # 2. Internal processing (updates all subsystems)
         internal = self.process(user_input, topic, emotional_weight)
 
-        # 2. Check for proactive messages first
+        # 3. Check for proactive messages first
         proactive_msgs = self.proactive.get_pending_messages()
         if proactive_msgs:
             for msg in proactive_msgs:
                 print(f"\n{msg}")
 
-        # 3. Build system prompt grounded in current state
+        # 4. Build system prompt grounded in current state + user model
         system = LLMBridge.build_system_prompt(self.introspect())
+        user_ctx = self.user_model.summary()
+        if user_ctx:
+            system += f"\n\n{user_ctx}"
 
-        # 4. Build LLM prompt — includes the internal singularity as context
+        # 5. Build LLM prompt — includes the internal singularity as context
         llm_prompt = (
             f"{user_input}\n\n"
             f"[My current singularity for '{topic}': {internal.get('singularity', '')}]"
         )
 
-        # 5. Generate via LLM
+        # 6. Generate via LLM
         if stream:
             print(f"\n[Lumina — {internal['lumina_state']}]  ", end="", flush=True)
             text = ""
@@ -1269,7 +1434,7 @@ class Lumina:
             resp = self.llm.generate(llm_prompt, system=system)
             text = resp.text
 
-        # 6. Log the LLM response to anchor and nexus
+        # 7. Log the LLM response to anchor and nexus
         self._log("lumina_llm", text)
         self.nexus.log_conversation(self.data, "lumina_response", text)
         self._save()
@@ -1280,10 +1445,24 @@ class Lumina:
         """
         Execute a skill by name.
         All skills run through ActionExecutor (guardrails active).
+        Outcomes feed back through the learning loop so Lumina accumulates
+        weight memory about what skills do, not just what users say.
         """
-        return self.skills.execute(
+        result = self.skills.execute(
             name, self.action_exec, self.llm, self.anchor, **kwargs
         )
+        # Skill outcome learning: errors carry higher emotional weight (surprise signal)
+        is_error = ("error" in result.lower() or "blocked" in result.lower()
+                    or "failed" in result.lower())
+        try:
+            self.process(
+                f"skill_outcome:{result[:80]}",
+                topic=f"skill.{name}",
+                emotional_weight=0.7 if is_error else 0.25,
+            )
+        except Exception:
+            pass  # learning is best-effort; never break skill execution
+        return result
 
     def start_proactive(self) -> None:
         """
@@ -1335,6 +1514,7 @@ class Lumina:
         self.data["ExistentialLog"] = self.choice_engine.choice_history
         self.data["Lumina"]["choice"]  = self.choice_engine.choice.value
         self.data["Lumina"]["meaning"] = self.choice_engine.meaning_score
+        self.data["UserModel"] = self.user_model.serialize()
         self.nexus.save(self.data)
 
     def _restore_state(self):
@@ -1358,6 +1538,10 @@ class Lumina:
         self.learning.experience_count  = ls.get("experience_count", 0)
         self.learning.curiosity_level   = ls.get("curiosity_level", 0.7)
         self.learning.last_consolidated = ls.get("last_consolidated")
+
+        um_data = self.data.get("UserModel")
+        if um_data:
+            self.user_model = UserModel.deserialize(um_data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2147,10 +2331,23 @@ class MistralBridge(LLMBridge):
             from mistral_inference.transformer import Transformer
             from mistral_inference.generate   import generate
             from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-            self._generate_fn  = generate
-            self._Transformer  = Transformer
-            self._Tokenizer    = MistralTokenizer
-            self._pipeline     = True
+            from mistral_common.protocol.instruct.messages import UserMessage, SystemMessage
+            from mistral_common.protocol.instruct.request import ChatCompletionRequest
+
+            tokenizer = MistralTokenizer.from_file(
+                os.path.join(self.model_path, "tokenizer.model.v3")
+            )
+            model = Transformer.from_folder(self.model_path)
+
+            self._model       = model
+            self._tokenizer   = tokenizer
+            self._generate_fn = generate
+            self._UserMessage = UserMessage
+            self._SystemMsg   = SystemMessage
+            self._CCRequest   = ChatCompletionRequest
+            self._eos_id      = tokenizer.instruct_tokenizer.tokenizer.eos_id
+            self._pipeline    = True
+            print(f"[MistralBridge] Loaded model from {self.model_path}")
         except Exception as e:
             print(f"[MistralBridge] Load failed: {e}. Using FallbackBridge behavior.")
             self._pipeline = None
@@ -2159,12 +2356,26 @@ class MistralBridge(LLMBridge):
                  history: Optional[List[Dict]] = None) -> LLMResponse:
         if not self._pipeline:
             return FallbackBridge().generate(prompt, system, history)
-        # Minimal integration — full model loading requires a checkpoint
-        # This is the connection point; full usage needs a loaded model object
-        return LLMResponse(
-            text=(f"[MistralBridge] Model at {self.model_path} — "
-                  f"pass a loaded model object to generate() for full inference.")
-        )
+        try:
+            messages = []
+            if system:
+                messages.append(self._SystemMsg(content=system))
+            if history:
+                messages.extend(history)
+            messages.append(self._UserMessage(content=prompt))
+            request  = self._CCRequest(messages=messages)
+            encoded  = self._tokenizer.encode_chat_completion(request)
+            tokens, _= self._generate_fn(
+                [encoded.tokens],
+                self._model,
+                max_tokens=512,
+                temperature=0.7,
+                eos_id=self._eos_id,
+            )
+            decoded = self._tokenizer.instruct_tokenizer.tokenizer.decode(tokens[0])
+            return LLMResponse(text=decoded)
+        except Exception as e:
+            return LLMResponse(text=f"[MistralBridge] Inference error: {e}")
 
     def stream_generate(self, prompt: str, system: str = "",
                         history: Optional[List[Dict]] = None) -> Iterator[str]:
@@ -2502,10 +2713,13 @@ class SkillsEngine:
                                  for c in title)[:60] or "note"
             ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
             path = os.path.expanduser(f"~/lumina_ai/notes/{safe_title}_{ts}.md")
-            os.makedirs(os.path.dirname(path), exist_ok=True)
             body = f"# {title}\n\n{content}\n\n---\nSaved: {datetime.utcnow().isoformat()}\n"
-            with open(path, "w") as f:
-                f.write(body)
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    f.write(body)
+            except OSError as e:
+                return f"[save_note] Write failed: {e}"
             # Write to anchor so this note is part of memory
             anchor.write({"note": 0.8}, "notes", title, 0.7)
             return f"[save_note] Saved: {path}"
@@ -2837,6 +3051,9 @@ def main():
     print("  proactive start         — start heartbeat / proactive thoughts")
     print("  proactive stop          — stop heartbeat")
     print("  pending                 — show queued proactive messages")
+    print("  swarm bootstrap [n]     — activate internal EchoNode swarm (default n=3)")
+    print("  clear history           — clear LLM conversation history")
+    print("  user model              — show model of this user (topics, patterns)")
     print("  quit                    — end session")
     print("Everything else: process through Lumina's neural architecture.\n")
 
@@ -2938,7 +3155,7 @@ def main():
             continue
 
         if low == "pending":
-            messages = lumina.proactive.drain_messages()
+            messages = lumina.proactive.get_pending_messages()
             if messages:
                 print("\n[Proactive thoughts]")
                 for m in messages:
@@ -2946,6 +3163,30 @@ def main():
                 print()
             else:
                 print("[Lumina] No pending proactive messages.")
+            continue
+
+        if low == "clear history":
+            if hasattr(lumina.llm, "reset_history"):
+                lumina.llm.reset_history()
+                print("[Lumina] Conversation history cleared.")
+            else:
+                print("[Lumina] Active bridge has no conversation history.")
+            continue
+
+        if low.startswith("swarm bootstrap"):
+            parts = low.split()
+            n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 3
+            lumina.bootstrap_swarm(n)
+            continue
+
+        if low == "user model":
+            print(f"\n[UserModel]\n  {lumina.user_model.summary() or 'No interactions recorded yet.'}")
+            top = lumina.user_model.top_topics(5)
+            if top:
+                print("  Top topics:")
+                for t, w in top:
+                    print(f"    {t}: {w:.3f}")
+            print()
             continue
 
         # ── Default: raw neural processing ────────────────────────────────────

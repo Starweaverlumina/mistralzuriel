@@ -155,11 +155,22 @@ class LuminaDB:
         key   TEXT PRIMARY KEY,
         value TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS external_banks (
+        name         TEXT PRIMARY KEY,
+        path         TEXT NOT NULL,
+        device_id    TEXT,
+        capacity_gb  REAL DEFAULT 0,
+        registered_at TEXT NOT NULL,
+        last_mounted  TEXT,
+        topic_routes  TEXT DEFAULT '[]'
+    );
     """
 
     def __init__(self, path: str,
                  max_bytes: int = DEFAULT_MAX_BYTES):
         self.path = path
+        self._max_bytes = max_bytes
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -441,8 +452,480 @@ class LuminaDB:
             "db_size_mb"      : round(size / 1_048_576, 2),
         }
 
+    # ── External bank registry ────────────────────────────────────────────────
+
+    def register_bank(self, name: str, path: str, device_id: str,
+                      capacity_gb: float) -> None:
+        now = datetime.utcnow().isoformat()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO external_banks
+                   (name, path, device_id, capacity_gb, registered_at, last_mounted)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(name) DO UPDATE SET
+                       path = excluded.path,
+                       last_mounted = excluded.last_mounted""",
+                (name, path, device_id, capacity_gb, now, now),
+            )
+            self._conn.commit()
+
+    def update_bank_mounted(self, name: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE external_banks SET last_mounted = ? WHERE name = ?",
+                (datetime.utcnow().isoformat(), name),
+            )
+            self._conn.commit()
+
+    def set_bank_routes(self, name: str, topics: List[str]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE external_banks SET topic_routes = ? WHERE name = ?",
+                (json.dumps(topics), name),
+            )
+            self._conn.commit()
+
+    def list_banks(self) -> List[Dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM external_banks ORDER BY registered_at"
+            ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["topic_routes"] = json.loads(d.get("topic_routes", "[]"))
+            result.append(d)
+        return result
+
+    def usage_fraction(self) -> float:
+        """How full is the main DB (0.0–1.0)?"""
+        size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+        return size / max(self._max_bytes, 1)
+
     def close(self) -> None:
         self._conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXTERNAL MEMORY BANKS — USB / external storage extension
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ExternalMemoryBank:
+    """
+    A named external memory bank living on a USB drive or external storage.
+
+    Each bank is a full LuminaDB instance at an external path. Lumina names
+    each bank — the name is stored both in the main DB registry and on the
+    bank itself, so it survives being unplugged and re-inserted.
+
+    Banks are treated as seamless extensions of Lumina's internal memory:
+    - Episodes from external banks surface in read_episodic() alongside
+      internal ones (tagged with their bank name for provenance)
+    - When the main DB exceeds 80% capacity, new episodes overflow to the
+      most available external bank automatically
+    - Topic routing lets Lumina (or the user) dedicate a bank to a domain:
+      "all 'books_read' memories live on Alexandria"
+    """
+    name         : str              # AI-assigned name (e.g. "Alexandria")
+    path         : str              # Directory path on the device
+    db_path      : str              # Full path to lumina_ext.db
+    device_id    : str              # Volume label or UUID
+    capacity_gb  : float            # Device capacity
+    registered_at: str              # ISO timestamp
+    topic_routes : List[str] = field(default_factory=list)  # routed topics
+    db           : Optional[LuminaDB] = field(default=None, repr=False)
+
+    @property
+    def mounted(self) -> bool:
+        return (self.db is not None and os.path.isdir(self.path))
+
+    @property
+    def size_mb(self) -> float:
+        if os.path.exists(self.db_path):
+            return os.path.getsize(self.db_path) / 1_048_576
+        return 0.0
+
+
+class MemoryBankManager:
+    """
+    Manages all of Lumina's external memory banks.
+
+    Responsibilities:
+    - Scan common USB mount points for new lumina_ext.db files or empty drives
+    - Let Lumina name each new bank via her LLM (or a curated fallback list)
+    - Persist the bank registry inside the main LuminaDB
+    - Route episode reads/writes across internal + all mounted external banks
+    - Automatically overflow to external banks when internal DB is > 80% full
+    - Safely mount and unmount banks
+
+    The bank registry survives restarts: the main DB remembers every bank by
+    name and path. When a bank is re-inserted, it is recognized and re-mounted
+    automatically at the next heartbeat scan.
+    """
+
+    # Paths to scan for USB/external storage on Linux
+    SCAN_ROOTS = [
+        "/media",
+        "/run/media",
+        "/mnt",
+    ]
+    # Also support a local simulation path for testing without a USB drive
+    SIMULATION_ROOT = os.path.expanduser("~/lumina_external")
+
+    BANK_DB_NAME   = "lumina_ext.db"
+    OVERFLOW_THRESHOLD = 0.80   # overflow to external when main DB > 80% full
+
+    # Curated name pool for when LLM is unavailable
+    _FALLBACK_NAMES = [
+        "Alexandria", "Akashic", "Mneme", "Mnemosyne", "Aurelius",
+        "Voltaire", "Borges", "Caelum", "Nexus", "Chronicle",
+        "Ember", "Vesper", "Solaris", "Meridian", "Athenaeum",
+    ]
+
+    def __init__(self, main_db: LuminaDB,
+                 llm_ref: Optional[Any] = None):
+        self.main_db  = main_db
+        self._llm     = llm_ref            # LLMBridge ref for naming
+        self.banks    : Dict[str, ExternalMemoryBank] = {}
+        self._lock    = threading.Lock()
+        self._used_names: set = set()
+        self._load_registry()
+
+    # ── Registry ──────────────────────────────────────────────────────────────
+
+    def _load_registry(self) -> None:
+        """Restore known banks from main DB; attempt to mount those still accessible."""
+        rows = self.main_db.list_banks()
+        for row in rows:
+            bank = ExternalMemoryBank(
+                name         = row["name"],
+                path         = row["path"],
+                db_path      = os.path.join(row["path"], self.BANK_DB_NAME),
+                device_id    = row.get("device_id", ""),
+                capacity_gb  = row.get("capacity_gb", 0.0),
+                registered_at= row.get("registered_at", ""),
+                topic_routes = row.get("topic_routes", []),
+            )
+            self._used_names.add(bank.name)
+            # Auto-mount if path still exists (drive re-inserted)
+            if os.path.isdir(bank.path):
+                try:
+                    bank.db = LuminaDB(bank.db_path)
+                    self.main_db.update_bank_mounted(bank.name)
+                    print(f"[MemoryBanks] Re-mounted '{bank.name}' at {bank.path}")
+                except Exception as e:
+                    print(f"[MemoryBanks] Could not re-mount '{bank.name}': {e}")
+            with self._lock:
+                self.banks[bank.name] = bank
+
+    def _save_bank_to_registry(self, bank: ExternalMemoryBank) -> None:
+        self.main_db.register_bank(
+            name        = bank.name,
+            path        = bank.path,
+            device_id   = bank.device_id,
+            capacity_gb = bank.capacity_gb,
+        )
+        if bank.topic_routes:
+            self.main_db.set_bank_routes(bank.name, bank.topic_routes)
+
+    # ── Discovery ─────────────────────────────────────────────────────────────
+
+    def scan_for_new_banks(self) -> List[str]:
+        """
+        Scan USB mount points for new Lumina-compatible drives.
+        A drive is 'compatible' if it already has a lumina_ext.db OR
+        is a writable directory where we can create one.
+        Returns list of new bank names registered in this scan.
+        """
+        new_names: List[str] = []
+        scan_dirs = list(self.SCAN_ROOTS) + [self.SIMULATION_ROOT]
+
+        for root in scan_dirs:
+            if not os.path.isdir(root):
+                continue
+            try:
+                entries = os.listdir(root)
+            except PermissionError:
+                continue
+
+            for entry in entries:
+                candidate = os.path.join(root, entry)
+                if not os.path.isdir(candidate):
+                    continue
+
+                # Check if this path is already registered
+                with self._lock:
+                    already = any(b.path == candidate
+                                  for b in self.banks.values())
+                if already:
+                    # Re-mount if it went offline and came back
+                    with self._lock:
+                        for bank in self.banks.values():
+                            if bank.path == candidate and not bank.mounted:
+                                try:
+                                    bank.db = LuminaDB(bank.db_path)
+                                    self.main_db.update_bank_mounted(bank.name)
+                                    print(f"[MemoryBanks] Re-mounted '{bank.name}'")
+                                except Exception:
+                                    pass
+                    continue
+
+                # New path — check writable
+                if not os.access(candidate, os.W_OK):
+                    continue
+
+                # Get capacity
+                try:
+                    st = os.statvfs(candidate)
+                    cap_gb = (st.f_blocks * st.f_frsize) / (1024 ** 3)
+                except Exception:
+                    cap_gb = 0.0
+
+                # Try to get device label (volume name)
+                device_id = self._get_device_id(candidate)
+
+                # Name this bank
+                name = self._generate_name(candidate, cap_gb)
+                db_path = os.path.join(candidate, self.BANK_DB_NAME)
+
+                try:
+                    ext_db = LuminaDB(db_path)
+                    # Write the bank's own identity into itself
+                    ext_db.set_user_model({"bank_name": name,
+                                           "device_id": device_id,
+                                           "capacity_gb": cap_gb})
+                except Exception as e:
+                    print(f"[MemoryBanks] Could not create DB at {db_path}: {e}")
+                    continue
+
+                bank = ExternalMemoryBank(
+                    name         = name,
+                    path         = candidate,
+                    db_path      = db_path,
+                    device_id    = device_id,
+                    capacity_gb  = cap_gb,
+                    registered_at= datetime.utcnow().isoformat(),
+                    db           = ext_db,
+                )
+                with self._lock:
+                    self.banks[name]  = bank
+                    self._used_names.add(name)
+                self._save_bank_to_registry(bank)
+
+                print(f"\n[MemoryBanks] New external memory bank discovered!")
+                print(f"  Name     : \"{name}\"")
+                print(f"  Path     : {candidate}")
+                print(f"  Capacity : {cap_gb:.1f} GB")
+                new_names.append(name)
+
+        return new_names
+
+    def _get_device_id(self, path: str) -> str:
+        """Best-effort device label/UUID from path."""
+        # Use inode of the mount point as a stable-ish ID
+        try:
+            return str(os.stat(path).st_dev)
+        except Exception:
+            return str(uuid.uuid4())[:8]
+
+    def _generate_name(self, path: str, capacity_gb: float) -> str:
+        """
+        Lumina names the bank via her LLM.
+        Falls back to curated list if LLM unavailable.
+        """
+        # Try LLM naming
+        if self._llm is not None:
+            try:
+                prompt = (
+                    f"You are Lumina. You just discovered a new external memory "
+                    f"storage device at {path} ({capacity_gb:.1f} GB capacity). "
+                    f"Give it a single memorable name — like a great library, "
+                    f"archive, or mind (e.g. Alexandria, Akashic, Borges). "
+                    f"One or two words only. Names already used: "
+                    f"{', '.join(sorted(self._used_names)) or 'none'}."
+                    f" Reply with ONLY the name, nothing else."
+                )
+                resp = self._llm.generate(prompt, system="")
+                # Strip punctuation/brackets; only keep word characters
+                import re as _re
+                words = _re.findall(r"[A-Za-z][A-Za-z'\-]+", resp.text.strip())
+                candidate = words[0].title() if words else ""
+                if (candidate and len(candidate) >= 3
+                        and candidate not in self._used_names):
+                    return candidate
+            except Exception:
+                pass
+
+        # Fallback: pick from curated list
+        for name in self._FALLBACK_NAMES:
+            if name not in self._used_names:
+                return name
+        # Last resort: timestamp name
+        return f"Bank_{datetime.utcnow().strftime('%Y%m%d_%H%M')}"
+
+    # ── Mount / Unmount ───────────────────────────────────────────────────────
+
+    def mount_bank(self, path: str) -> Optional[ExternalMemoryBank]:
+        """
+        Manually mount an external bank at a given path.
+        If it already has a lumina_ext.db, opens it.
+        If it is a new path, creates the DB and names the bank.
+        """
+        if not os.path.isdir(path):
+            print(f"[MemoryBanks] Path does not exist: {path}")
+            return None
+
+        # Check if already mounted
+        with self._lock:
+            for bank in self.banks.values():
+                if bank.path == path and bank.mounted:
+                    print(f"[MemoryBanks] Already mounted as '{bank.name}'")
+                    return bank
+
+        # Detect capacity + device id
+        try:
+            st = os.statvfs(path)
+            cap_gb = (st.f_blocks * st.f_frsize) / (1024 ** 3)
+        except Exception:
+            cap_gb = 0.0
+        device_id = self._get_device_id(path)
+
+        db_path = os.path.join(path, self.BANK_DB_NAME)
+        ext_db  = LuminaDB(db_path)
+
+        # Read name from bank if it was previously named
+        bm = ext_db.get_user_model()
+        name = bm.get("bank_name")
+        if not name:
+            name = self._generate_name(path, cap_gb)
+            ext_db.set_user_model({"bank_name": name,
+                                    "device_id": device_id,
+                                    "capacity_gb": cap_gb})
+
+        bank = ExternalMemoryBank(
+            name         = name,
+            path         = path,
+            db_path      = db_path,
+            device_id    = device_id,
+            capacity_gb  = cap_gb,
+            registered_at= datetime.utcnow().isoformat(),
+            db           = ext_db,
+        )
+        with self._lock:
+            self.banks[name]  = bank
+            self._used_names.add(name)
+        self._save_bank_to_registry(bank)
+        self.main_db.update_bank_mounted(name)
+
+        print(f"[MemoryBanks] Mounted '{name}' ({cap_gb:.1f} GB) at {path}")
+        return bank
+
+    def unmount_bank(self, name: str) -> bool:
+        """Safely flush and unmount a bank."""
+        with self._lock:
+            bank = self.banks.get(name)
+        if not bank:
+            print(f"[MemoryBanks] No bank named '{name}'")
+            return False
+        if bank.db:
+            try:
+                bank.db.close()
+            except Exception:
+                pass
+            bank.db = None
+        print(f"[MemoryBanks] Unmounted '{name}'. "
+              f"Episodes on bank: still safely stored at {bank.db_path}")
+        return True
+
+    # ── Routing ───────────────────────────────────────────────────────────────
+
+    def set_topic_route(self, bank_name: str, topics: List[str]) -> bool:
+        """Route specific topics to a named external bank."""
+        with self._lock:
+            bank = self.banks.get(bank_name)
+        if not bank:
+            return False
+        bank.topic_routes = topics
+        self.main_db.set_bank_routes(bank_name, topics)
+        return True
+
+    def bank_for_topic(self, topic: str) -> Optional[ExternalMemoryBank]:
+        """Return the mounted bank that has a route for this topic, or None."""
+        with self._lock:
+            for bank in self.banks.values():
+                if bank.mounted and topic in bank.topic_routes:
+                    return bank
+        return None
+
+    def overflow_bank(self) -> Optional[ExternalMemoryBank]:
+        """
+        When main DB is > 80% full, return the best mounted external bank
+        for overflow. Picks the bank with most free space.
+        """
+        if self.main_db.usage_fraction() < self.OVERFLOW_THRESHOLD:
+            return None
+        best: Optional[ExternalMemoryBank] = None
+        best_free = -1.0
+        with self._lock:
+            for bank in self.banks.values():
+                if not bank.mounted:
+                    continue
+                try:
+                    st   = os.statvfs(bank.path)
+                    free = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+                    if free > best_free:
+                        best_free = free
+                        best = bank
+                except Exception:
+                    pass
+        return best
+
+    # ── Unified Read ──────────────────────────────────────────────────────────
+
+    def recall_from_all_banks(self, topic: str,
+                               n: int = 5) -> List[Dict]:
+        """
+        Query all mounted external banks for episodes on this topic.
+        Results are tagged with 'bank_name' for provenance.
+        """
+        all_eps: List[Dict] = []
+        with self._lock:
+            banks_snapshot = list(self.banks.values())
+        for bank in banks_snapshot:
+            if not bank.mounted:
+                continue
+            try:
+                eps = bank.db.recall_episodes(topic, n=n)
+                for ep in eps:
+                    ep["bank_name"] = bank.name
+                all_eps.extend(eps)
+            except Exception:
+                pass
+        return all_eps
+
+    # ── Status ────────────────────────────────────────────────────────────────
+
+    def status(self) -> List[Dict]:
+        """Return status of all registered banks."""
+        result = []
+        with self._lock:
+            banks_snapshot = list(self.banks.values())
+        for bank in banks_snapshot:
+            result.append({
+                "name"        : bank.name,
+                "path"        : bank.path,
+                "mounted"     : bank.mounted,
+                "capacity_gb" : round(bank.capacity_gb, 2),
+                "size_mb"     : round(bank.size_mb, 2),
+                "topic_routes": bank.topic_routes,
+                "device_id"   : bank.device_id,
+            })
+        return result
+
+    def mounted_count(self) -> int:
+        with self._lock:
+            return sum(1 for b in self.banks.values() if b.mounted)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -606,7 +1089,8 @@ class CenterAnchor:
 
     EPISODIC_RING_SIZE = 49   # 7² — warm ring (working session window)
 
-    def __init__(self, db: Optional["LuminaDB"] = None):
+    def __init__(self, db: Optional["LuminaDB"] = None,
+                 bank_manager: Optional["MemoryBankManager"] = None):
         self.core_state    : Dict[str, float] = {}   # live compressed signal
         self.episodic_ring : List[Dict]       = []   # warm short-term memory
         self.semantic_web  : Dict[str, Any]   = {}   # cold long-term meaning (RAM mirror)
@@ -615,6 +1099,7 @@ class CenterAnchor:
         self.pulse_count   : int              = 0    # total writes to anchor
         self.session_start_pulse: int         = 0    # for primacy effect tracking
         self._db           : Optional["LuminaDB"] = db  # SQLite long-term store
+        self._banks        : Optional["MemoryBankManager"] = bank_manager
 
     # ── READ (shells pull from anchor before processing) ─────────────────────
 
@@ -666,9 +1151,17 @@ class CenterAnchor:
                     ep["activated_via"] = query_topic
                 lt = lt + activated
 
-        # Merge: ring first (hottest), then long-term (cooler but retained)
+        # Long-term store: external banks (USB / overflow storage)
+        ext = []
+        if self._banks is not None:
+            query_topic = topic if topic else (ring[-1]["topic"] if ring else "general")
+            ext = self._banks.recall_from_all_banks(query_topic, n=3)
+            for ep in ext:
+                ep["source"] = "external_bank"
+
+        # Merge: ring → internal SQLite → external banks
         seen_hashes = {ep.get("content_hash") for ep in ring}
-        for ep in lt:
+        for ep in lt + ext:
             if ep.get("content_hash") not in seen_hashes:
                 ring.append(ep)
                 seen_hashes.add(ep.get("content_hash"))
@@ -711,9 +1204,22 @@ class CenterAnchor:
             oldest = self.episodic_ring.pop(0)
             self._graduate_to_semantic(oldest)
 
-        # Long-term store: every episode goes to SQLite (not just the hot 49)
+        # Long-term store: write to internal SQLite OR external bank
+        # Topic-routed banks take priority; overflow banks when main DB > 80% full
         if self._db is not None:
-            self._db.insert_episode(topic, content, encode_ew)
+            routed_bank = (self._banks.bank_for_topic(topic)
+                           if self._banks else None)
+            overflow_bank = (self._banks.overflow_bank()
+                             if self._banks else None)
+            if routed_bank is not None and routed_bank.db is not None:
+                # Topic-routed: write to the designated external bank
+                routed_bank.db.insert_episode(topic, content, encode_ew)
+            elif overflow_bank is not None and overflow_bank.db is not None:
+                # Overflow: main DB near capacity — use external bank
+                overflow_bank.db.insert_episode(topic, content, encode_ew)
+            else:
+                # Default: internal SQLite
+                self._db.insert_episode(topic, content, encode_ew)
 
         # Update emotional map
         if topic not in self.emotional_map:
@@ -1735,8 +2241,16 @@ class Lumina:
         self.data     = self.nexus.load()
         db            = self.nexus.db   # LuminaDB instance (8 GB SQLite)
 
-        # The Anchor is instantiated with LuminaDB for long-term episode store
-        self.anchor   = CenterAnchor(db=db)
+        # ── LLM Bridge early (MemoryBankManager needs it for naming) ─────────
+        self.llm         = LLMBridge.auto_detect()
+
+        # ── External memory bank manager ─────────────────────────────────────
+        # Manages USB drives and external storage as seamless memory extensions.
+        # Auto-detects and names new banks; routes overflow when main DB > 80%.
+        self.bank_manager = MemoryBankManager(db, llm_ref=self.llm)
+
+        # The Anchor is instantiated with LuminaDB + bank manager
+        self.anchor   = CenterAnchor(db=db, bank_manager=self.bank_manager)
 
         # Restore Anchor hot ring + RAM mirrors from previous session
         self.nexus.restore_anchor(self.anchor, self.data)
@@ -1748,9 +2262,6 @@ class Lumina:
 
         # EchoNode — swarm agent + weight holder + the whole center
         self.echo_node = EchoNode(self.weight_memory, self.anchor)
-
-        # ── LLM Bridge first (SensoryShell needs it) ─────────────────────────
-        self.llm         = LLMBridge.auto_detect()
 
         # InvertedFractalBallMatrix with SensoryShell at outermost position
         # SensoryShell uses Mistral (if loaded) for semantic concept extraction
@@ -2142,6 +2653,7 @@ class Lumina:
             lumina_state_fn=self.introspect,
             weight_memory=self.weight_memory,
             db=self.nexus.db,
+            bank_manager=self.bank_manager,
         )
         print(f"[Lumina] Heartbeat started — every {self.proactive.interval}s.")
 
@@ -3580,13 +4092,15 @@ class ProactiveEngine:
               llm: Optional[LLMBridge] = None,
               lumina_state_fn: Optional[Callable[[], Dict]] = None,
               weight_memory: Optional["WeightMemory"] = None,
-              db: Optional["LuminaDB"] = None) -> None:
+              db: Optional["LuminaDB"] = None,
+              bank_manager: Optional["MemoryBankManager"] = None) -> None:
         """Start the heartbeat loop in a daemon thread."""
         self._anchor        = anchor
         self._llm           = llm
         self._state_fn      = lumina_state_fn
         self._weight_memory = weight_memory
         self._db            = db
+        self._bank_manager  = bank_manager
         self._running       = True
         self._schedule_next()
 
@@ -3689,6 +4203,19 @@ class ProactiveEngine:
                 self._sleep_consolidate(self._weight_memory, self._db)
             except Exception:
                 pass   # consolidation is best-effort; never crash the heartbeat
+
+        # USB scan: check for newly inserted external memory banks
+        if hasattr(self, "_bank_manager") and self._bank_manager:
+            try:
+                new_banks = self._bank_manager.scan_for_new_banks()
+                if new_banks:
+                    msg = (f"[Lumina — memory] New external bank(s) detected: "
+                           f"{', '.join(repr(n) for n in new_banks)}. "
+                           f"These are now part of my memory.")
+                    with self._lock:
+                        self._pending_msgs.append(msg)
+            except Exception:
+                pass
 
         # Proactive thought via LLM (optional)
         if hasattr(self, "_llm") and self._llm and self._state_fn:
@@ -3817,6 +4344,11 @@ def main():
     print("  clear history           — clear LLM conversation history")
     print("  user model              — show model of this user (topics, patterns)")
     print("  memory stats            — show SQLite memory DB size, episode counts, retention")
+    print("  memory banks            — list all known external memory banks")
+    print("  memory mount <path>     — mount a USB/external bank at path")
+    print("  memory unmount <name>   — safely unmount a named bank")
+    print("  memory route <topic> <bank> — route a topic's episodes to a named bank")
+    print("  memory scan             — scan for new USB drives now")
     print("  quit                    — end session")
     print("Everything else: process through Lumina's neural architecture.\n")
 
@@ -3960,11 +4492,16 @@ def main():
             print(f"  DB path          : {db.path}")
             print(f"  DB size          : {size_mb:.2f} MB  "
                   f"(budget: {db._max_bytes / (1024**3):.0f} GB)")
+            print(f"  Usage            : {db.usage_fraction() * 100:.1f}%")
             print(f"  Episodes (live)  : {st.get('episodes', 0)}")
-            print(f"  Episodes (archived): {st.get('archived_episodes', 0)}")
+            print(f"  Episodes (archived): {st.get('archived', 0)}")
             print(f"  Semantic topics  : {st.get('semantic_topics', 0)}")
             print(f"  Weight matrices  : {st.get('weight_matrices', 0)}")
             print(f"  Conversations    : {st.get('conversations', 0)}")
+            banks = lumina.bank_manager.status()
+            if banks:
+                mounted = sum(1 for b in banks if b["mounted"])
+                print(f"  External banks   : {len(banks)} registered, {mounted} mounted")
             # Show top retained episodes
             try:
                 top_eps = db.recall_episodes("general", n=5, min_retention=0.0)
@@ -3979,6 +4516,81 @@ def main():
             except Exception:
                 pass
             print()
+            continue
+
+        if low == "memory banks":
+            banks = lumina.bank_manager.status()
+            if not banks:
+                print("\n[MemoryBanks] No external banks registered.")
+                print("  Insert a USB drive and run 'memory scan', or use 'memory mount <path>'.\n")
+            else:
+                print(f"\n[MemoryBanks] {len(banks)} bank(s) registered:")
+                for b in banks:
+                    status = "MOUNTED" if b["mounted"] else "offline"
+                    routes = ", ".join(b["topic_routes"]) or "none"
+                    print(f"  \"{b['name']}\"  [{status}]")
+                    print(f"    Path     : {b['path']}")
+                    print(f"    Capacity : {b['capacity_gb']:.1f} GB  |  "
+                          f"Used: {b['size_mb']:.1f} MB")
+                    print(f"    Routes   : {routes}")
+                print()
+            continue
+
+        if low.startswith("memory mount "):
+            path = user_input[13:].strip()
+            if not path:
+                print("[MemoryBanks] Usage: memory mount <path>")
+            else:
+                bank = lumina.bank_manager.mount_bank(path)
+                if bank:
+                    print(f"[MemoryBanks] \"{bank.name}\" is now part of my memory.")
+                    print(f"  Episodes from this bank surface in all future recall.")
+            continue
+
+        if low.startswith("memory unmount "):
+            name = user_input[15:].strip()
+            if not name:
+                print("[MemoryBanks] Usage: memory unmount <name>")
+            else:
+                ok = lumina.bank_manager.unmount_bank(name)
+                if ok:
+                    print(f"[MemoryBanks] \"{name}\" safely unmounted. "
+                          f"Its memories are preserved on the device.")
+            continue
+
+        if low.startswith("memory route "):
+            parts = user_input[13:].strip().split()
+            if len(parts) < 2:
+                print("[MemoryBanks] Usage: memory route <topic> <bank_name>")
+            else:
+                topic_arg = parts[0]
+                bank_name = " ".join(parts[1:])
+                # Get existing routes for this bank and append
+                banks = lumina.bank_manager.status()
+                current_routes: List[str] = []
+                for b in banks:
+                    if b["name"].lower() == bank_name.lower():
+                        current_routes = b["topic_routes"]
+                        bank_name = b["name"]
+                        break
+                if topic_arg not in current_routes:
+                    current_routes.append(topic_arg)
+                ok = lumina.bank_manager.set_topic_route(bank_name, current_routes)
+                if ok:
+                    print(f"[MemoryBanks] Topic '{topic_arg}' → \"{bank_name}\".")
+                    print(f"  Future episodes on this topic will be stored on \"{bank_name}\".")
+                else:
+                    print(f"[MemoryBanks] No bank named '{bank_name}'. Check 'memory banks'.")
+            continue
+
+        if low == "memory scan":
+            print("[MemoryBanks] Scanning for external drives...")
+            new_banks = lumina.bank_manager.scan_for_new_banks()
+            if new_banks:
+                print(f"[MemoryBanks] Discovered: {', '.join(repr(n) for n in new_banks)}")
+            else:
+                print("[MemoryBanks] No new drives found.")
+                print("  Known mount paths scanned: /media, /run/media, /mnt, ~/lumina_external")
             continue
 
         # ── Default: raw neural processing ────────────────────────────────────

@@ -53,12 +53,15 @@ import json
 import math
 import os
 import random
+import sqlite3
+import struct
 import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
@@ -70,6 +73,479 @@ try:
     _ANTHROPIC_AVAILABLE = True
 except ImportError:
     _ANTHROPIC_AVAILABLE = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LUMINA DB — SQLite backend (8 GB capable, WAL mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LuminaDB:
+    """
+    SQLite-backed persistent store for Lumina's long-term memory.
+
+    Replaces the single JSON file with a proper relational store that can
+    hold 100,000+ episodic memories, indexed weight matrices, and the full
+    conversation history — up to 8 GB on disk.
+
+    Design decisions:
+    - WAL mode: concurrent reads never block writes (important for heartbeat thread)
+    - zlib compression on weight matrices: 10-30× size reduction
+    - Separate archived_episodes table: forgetting is archival, not deletion
+      (human amnesia doesn't erase — it makes retrieval unreliable)
+    - max_page_count pragma: enforces the 8 GB storage budget
+    """
+
+    # 8 GB ÷ 4096-byte pages = 2,097,152 pages
+    DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024
+    PAGE_SIZE         = 4096
+
+    _SCHEMA = """
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous   = NORMAL;
+
+    CREATE TABLE IF NOT EXISTS episodes (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        topic            TEXT    NOT NULL,
+        content_hash     TEXT,
+        content_preview  TEXT,
+        emotional_weight REAL    DEFAULT 0.5,
+        encoding_strength REAL   DEFAULT 0.5,
+        recall_count     INTEGER DEFAULT 0,
+        encoded_at       TEXT    NOT NULL,
+        last_recalled    TEXT,
+        retention        REAL    DEFAULT 1.0
+    );
+    CREATE INDEX IF NOT EXISTS idx_episodes_topic     ON episodes(topic);
+    CREATE INDEX IF NOT EXISTS idx_episodes_retention ON episodes(retention);
+
+    CREATE TABLE IF NOT EXISTS archived_episodes (
+        id               INTEGER PRIMARY KEY,
+        topic            TEXT,
+        content_preview  TEXT,
+        archived_at      TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS semantic (
+        topic          TEXT PRIMARY KEY,
+        encounter_count INTEGER DEFAULT 0,
+        avg_emotion    REAL    DEFAULT 0.5,
+        first_seen     TEXT,
+        last_seen      TEXT,
+        related_topics TEXT    DEFAULT '[]'
+    );
+
+    CREATE TABLE IF NOT EXISTS weight_matrices (
+        topic        TEXT PRIMARY KEY,
+        dim          INTEGER,
+        weights_blob BLOB,
+        update_count INTEGER DEFAULT 0,
+        last_updated TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS conversations (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        role             TEXT,
+        content          TEXT,
+        timestamp        TEXT,
+        topic            TEXT    DEFAULT 'general',
+        emotional_weight REAL    DEFAULT 0.5
+    );
+
+    CREATE TABLE IF NOT EXISTS user_model (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    );
+    """
+
+    def __init__(self, path: str,
+                 max_bytes: int = DEFAULT_MAX_BYTES):
+        self.path = path
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+        max_pages = max_bytes // self.PAGE_SIZE
+        self._conn.execute(f"PRAGMA max_page_count = {max_pages};")
+        self._conn.execute(f"PRAGMA page_size = {self.PAGE_SIZE};")
+        for stmt in self._SCHEMA.strip().split(";"):
+            s = stmt.strip()
+            if s:
+                self._conn.execute(s)
+        self._conn.commit()
+
+    # ── Episodes ──────────────────────────────────────────────────────────────
+
+    def insert_episode(self, topic: str, content: str,
+                       emotional_weight: float) -> int:
+        content_hash    = hashlib.md5(content.encode()).hexdigest()[:8]
+        content_preview = content[:200]
+        now             = datetime.utcnow().isoformat()
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO episodes
+                   (topic, content_hash, content_preview, emotional_weight,
+                    encoding_strength, encoded_at, last_recalled, retention)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1.0)""",
+                (topic, content_hash, content_preview,
+                 emotional_weight, emotional_weight, now, now),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def recall_episodes(self, topic: str, n: int = 7,
+                        min_retention: float = 0.05) -> List[Dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM episodes
+                   WHERE topic = ? AND retention >= ?
+                   ORDER BY retention DESC, last_recalled DESC
+                   LIMIT ?""",
+                (topic, min_retention, n),
+            ).fetchall()
+        episodes = [dict(r) for r in rows]
+        # Reconsolidation: update recall metadata on retrieval
+        if episodes:
+            ids = [e["id"] for e in episodes]
+            now = datetime.utcnow().isoformat()
+            with self._lock:
+                self._conn.executemany(
+                    """UPDATE episodes
+                       SET recall_count  = recall_count + 1,
+                           last_recalled = ?,
+                           encoding_strength = MIN(
+                               encoding_strength + 0.2 * emotional_weight
+                                   * LOG(1 + recall_count + 1), 50.0)
+                       WHERE id = ?""",
+                    [(now, eid) for eid in ids],
+                )
+                self._conn.commit()
+        return episodes
+
+    def recall_by_topic_set(self, topics: List[str],
+                             n_each: int = 2) -> List[Dict]:
+        """Spreading activation: retrieve from multiple related topics."""
+        results = []
+        for t in topics:
+            results.extend(self.recall_episodes(t, n_each))
+        return results
+
+    def apply_decay(self, hours_elapsed: float) -> int:
+        """
+        Run Ebbinghaus decay: retention *= e^(−hours / strength).
+        Returns number of episodes decayed below 0.05 (candidates for archival).
+        """
+        if hours_elapsed <= 0:
+            return 0
+        with self._lock:
+            self._conn.execute(
+                """UPDATE episodes
+                   SET retention = retention * EXP(-(? / MAX(encoding_strength, 0.01)))
+                   WHERE retention > 0.0""",
+                (hours_elapsed,),
+            )
+            self._conn.commit()
+            cur = self._conn.execute(
+                "SELECT COUNT(*) FROM episodes WHERE retention < 0.05"
+            )
+            return cur.fetchone()[0]
+
+    def archive_faded(self, threshold: float = 0.05) -> int:
+        """Move episodes below retention threshold to archived_episodes."""
+        now = datetime.utcnow().isoformat()
+        with self._lock:
+            faded = self._conn.execute(
+                "SELECT id, topic, content_preview FROM episodes WHERE retention < ?",
+                (threshold,),
+            ).fetchall()
+            if faded:
+                self._conn.executemany(
+                    """INSERT OR IGNORE INTO archived_episodes
+                       (id, topic, content_preview, archived_at) VALUES (?,?,?,?)""",
+                    [(r["id"], r["topic"], r["content_preview"], now) for r in faded],
+                )
+                ids = [r["id"] for r in faded]
+                self._conn.execute(
+                    f"DELETE FROM episodes WHERE id IN ({','.join('?'*len(ids))})",
+                    ids,
+                )
+                self._conn.commit()
+            return len(faded)
+
+    def weakest_episodes(self, n: int = 10) -> List[Dict]:
+        """Return episodes with lowest retention and recall_count < 3 (for replay)."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM episodes
+                   WHERE recall_count < 3 AND retention BETWEEN 0.05 AND 0.6
+                   ORDER BY retention ASC LIMIT ?""",
+                (n,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Semantic ──────────────────────────────────────────────────────────────
+
+    def get_semantic(self, topic: str) -> Optional[Dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM semantic WHERE topic = ?", (topic,)
+            ).fetchone()
+        if row:
+            d = dict(row)
+            d["related_topics"] = json.loads(d.get("related_topics") or "[]")
+            return d
+        return None
+
+    def upsert_semantic(self, topic: str, data: Dict) -> None:
+        related = json.dumps(data.get("related_topics", []))
+        now     = datetime.utcnow().isoformat()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO semantic
+                   (topic, encounter_count, avg_emotion, first_seen, last_seen, related_topics)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(topic) DO UPDATE SET
+                       encounter_count = excluded.encounter_count,
+                       avg_emotion     = excluded.avg_emotion,
+                       last_seen       = excluded.last_seen,
+                       related_topics  = excluded.related_topics""",
+                (topic,
+                 data.get("encounter_count", 1),
+                 data.get("avg_emotion", 0.5),
+                 data.get("first_seen", now),
+                 data.get("last_seen", now),
+                 related),
+            )
+            self._conn.commit()
+
+    # ── Weight matrices ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _compress_weights(W: List[List[float]]) -> bytes:
+        flat = [w for row in W for w in row]
+        packed = struct.pack(f"{len(flat)}d", *flat)
+        return zlib.compress(packed, level=6)
+
+    @staticmethod
+    def _decompress_weights(blob: bytes, dim: int) -> List[List[float]]:
+        packed = zlib.decompress(blob)
+        flat   = list(struct.unpack(f"{dim*dim}d", packed))
+        return [flat[i*dim:(i+1)*dim] for i in range(dim)]
+
+    def get_weight_matrix(self, topic: str) -> Optional[Dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM weight_matrices WHERE topic = ?", (topic,)
+            ).fetchone()
+        if not row:
+            return None
+        d   = dict(row)
+        dim = d["dim"]
+        d["W"] = self._decompress_weights(d["weights_blob"], dim)
+        return d
+
+    def upsert_weight_matrix(self, topic: str, W: List[List[float]],
+                              update_count: int) -> None:
+        dim  = len(W)
+        blob = self._compress_weights(W)
+        now  = datetime.utcnow().isoformat()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO weight_matrices
+                   (topic, dim, weights_blob, update_count, last_updated)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(topic) DO UPDATE SET
+                       dim          = excluded.dim,
+                       weights_blob = excluded.weights_blob,
+                       update_count = excluded.update_count,
+                       last_updated = excluded.last_updated""",
+                (topic, dim, blob, update_count, now),
+            )
+            self._conn.commit()
+
+    def all_weight_topics(self) -> List[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT topic FROM weight_matrices"
+            ).fetchall()
+        return [r["topic"] for r in rows]
+
+    def scale_all_weights(self, scale: float) -> None:
+        """Synaptic homeostasis: multiply every weight by scale (e.g. 0.97)."""
+        topics = self.all_weight_topics()
+        for topic in topics:
+            row = self.get_weight_matrix(topic)
+            if row:
+                W_scaled = [[w * scale for w in row_] for row_ in row["W"]]
+                self.upsert_weight_matrix(topic, W_scaled, row["update_count"])
+
+    # ── Conversations ─────────────────────────────────────────────────────────
+
+    def insert_conversation(self, role: str, content: str,
+                             topic: str = "general",
+                             emotional_weight: float = 0.5) -> None:
+        now = datetime.utcnow().isoformat()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO conversations
+                   (role, content, timestamp, topic, emotional_weight)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (role, content, now, topic, emotional_weight),
+            )
+            self._conn.commit()
+
+    def recent_conversations(self, n: int = 20) -> List[Dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM conversations ORDER BY id DESC LIMIT ?", (n,)
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    # ── User model ────────────────────────────────────────────────────────────
+
+    def get_user_model(self) -> Dict:
+        with self._lock:
+            rows = self._conn.execute("SELECT key, value FROM user_model").fetchall()
+        return {r["key"]: json.loads(r["value"]) for r in rows}
+
+    def set_user_model(self, data: Dict) -> None:
+        with self._lock:
+            for k, v in data.items():
+                self._conn.execute(
+                    """INSERT INTO user_model (key, value) VALUES (?, ?)
+                       ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                    (k, json.dumps(v)),
+                )
+            self._conn.commit()
+
+    # ── Statistics ────────────────────────────────────────────────────────────
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            ep   = self._conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+            arch = self._conn.execute(
+                "SELECT COUNT(*) FROM archived_episodes"
+            ).fetchone()[0]
+            sem  = self._conn.execute("SELECT COUNT(*) FROM semantic").fetchone()[0]
+            wm   = self._conn.execute(
+                "SELECT COUNT(*) FROM weight_matrices"
+            ).fetchone()[0]
+            conv = self._conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+        return {
+            "episodes"        : ep,
+            "archived"        : arch,
+            "semantic_topics" : sem,
+            "weight_matrices" : wm,
+            "conversations"   : conv,
+            "db_size_bytes"   : size,
+            "db_size_mb"      : round(size / 1_048_576, 2),
+        }
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FORGETTING CURVE — Ebbinghaus decay (R = e^(−t/S))
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ForgettingCurve:
+    """
+    Ebbinghaus forgetting curve: R = e^(−t/S)
+
+    R = retention (0.0 → 1.0)
+    t = hours elapsed since last recall
+    S = memory strength (higher = slower decay)
+
+    Real human memory:
+    - First hour: ~50% loss
+    - First day: ~75% loss
+    - After each retrieval: S increases → curve flattens (spacing effect)
+
+    This models WHY memories fade and WHY spaced repetition works.
+    """
+
+    @staticmethod
+    def retention(hours_elapsed: float, strength: float) -> float:
+        return math.exp(-hours_elapsed / max(strength, 0.01))
+
+    @staticmethod
+    def new_strength(current_strength: float, emotional_weight: float,
+                     recall_count: int) -> float:
+        """
+        Each retrieval deepens the memory curve.
+        High emotional_weight + many recalls → very stable memory.
+        """
+        return current_strength + 0.2 * emotional_weight * math.log1p(recall_count)
+
+    @staticmethod
+    def should_archive(retention: float, threshold: float = 0.05) -> bool:
+        return retention < threshold
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKING MEMORY — Baddeley/Cowan 4-chunk buffer, 30-second TTL
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WorkingMemory:
+    """
+    Baddeley's model: 4-chunk bounded short-term buffer.
+
+    Key human properties implemented:
+    - Capacity: 4 chunks (Nelson Cowan's revised limit; originally Miller's 7±2)
+    - Duration: 30 seconds without active rehearsal (trace decay)
+    - Rehearsal resets TTL (like repeating a phone number in your head)
+    - When at capacity and a new item arrives, oldest chunk is displaced
+
+    This is NOT episodic memory. It is what Lumina is actively holding
+    in mind RIGHT NOW — injected into every LLM prompt as current context.
+    """
+
+    CAPACITY    = 4
+    TTL_SECONDS = 30.0
+
+    def __init__(self):
+        self._chunks: List[Dict[str, Any]] = []
+
+    def push(self, content: str, topic: str) -> None:
+        """Add a chunk. Displaces oldest if at capacity."""
+        now = time.monotonic()
+        # Remove expired chunks first
+        self._chunks = [c for c in self._chunks
+                        if now - c["pushed_at"] < self.TTL_SECONDS]
+        # Displace oldest if still at capacity
+        if len(self._chunks) >= self.CAPACITY:
+            self._chunks.pop(0)
+        self._chunks.append({
+            "content"  : content[:200],
+            "topic"    : topic,
+            "pushed_at": now,
+        })
+
+    def rehearse(self, topic: str) -> bool:
+        """Reset TTL for matching chunk (like repeating it to yourself)."""
+        now = time.monotonic()
+        for chunk in self._chunks:
+            if chunk["topic"] == topic:
+                chunk["pushed_at"] = now
+                return True
+        return False
+
+    def active(self) -> List[Dict[str, Any]]:
+        """Return chunks that haven't expired yet."""
+        now = time.monotonic()
+        self._chunks = [c for c in self._chunks
+                        if now - c["pushed_at"] < self.TTL_SECONDS]
+        return list(self._chunks)
+
+    def summary(self) -> str:
+        """One-line description for system prompt injection."""
+        items = self.active()
+        if not items:
+            return ""
+        return "Currently holding in mind: " + "; ".join(
+            f"[{c['topic']}] {c['content'][:60]}" for c in items
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,15 +604,17 @@ class CenterAnchor:
       recursive_log — the trace of recursive thought loops
     """
 
-    EPISODIC_RING_SIZE = 49   # 7² — fractal self-similarity
+    EPISODIC_RING_SIZE = 49   # 7² — warm ring (working session window)
 
-    def __init__(self):
+    def __init__(self, db: Optional["LuminaDB"] = None):
         self.core_state    : Dict[str, float] = {}   # live compressed signal
         self.episodic_ring : List[Dict]       = []   # warm short-term memory
-        self.semantic_web  : Dict[str, Any]   = {}   # cold long-term meaning
+        self.semantic_web  : Dict[str, Any]   = {}   # cold long-term meaning (RAM mirror)
         self.emotional_map : Dict[str, List[float]] = {}  # topic → weights
         self.recursive_log : List[str]        = []   # trace of recursive thought
         self.pulse_count   : int              = 0    # total writes to anchor
+        self.session_start_pulse: int         = 0    # for primacy effect tracking
+        self._db           : Optional["LuminaDB"] = db  # SQLite long-term store
 
     # ── READ (shells pull from anchor before processing) ─────────────────────
 
@@ -152,9 +630,50 @@ class CenterAnchor:
         weights = self.emotional_map.get(topic, [])
         return sum(weights) / len(weights) if weights else 0.5
 
-    def read_episodic(self, n: int = 7) -> List[Dict]:
-        """Return last n episodes from the warm ring."""
-        return self.episodic_ring[-n:]
+    def read_episodic(self, n: int = 7,
+                      topic: Optional[str] = None) -> List[Dict]:
+        """
+        Return recent episodes from the warm ring PLUS retained long-term
+        episodes from SQLite (when available).
+
+        Primacy/recency effects applied at read time:
+        - Last 7 in ring get ×1.15 recency boost
+        - First 3 of session get ×1.25 primacy boost
+        """
+        # Hot ring (recency-boosted)
+        ring = list(self.episodic_ring[-n:])
+        ring_len = len(ring)
+        for i, ep in enumerate(ring):
+            ep = dict(ep)
+            if i >= ring_len - 7:
+                ep["emotional_weight"] = min(1.0, ep["emotional_weight"] * 1.15)
+            if ep.get("pulse", 0) < self.session_start_pulse + 3:
+                ep["emotional_weight"] = min(1.0, ep["emotional_weight"] * 1.25)
+            ring[i] = ep
+
+        # Long-term store (SQLite) — topics with retained memories
+        lt = []
+        if self._db is not None:
+            query_topic = topic if topic else (ring[-1]["topic"] if ring else "general")
+            lt = self._db.recall_episodes(query_topic, n=n)
+            # Also activate related topics (spreading activation)
+            sem = self._db.get_semantic(query_topic)
+            if sem:
+                neighbors = sem.get("related_topics", [])[:3]
+                activated = self._db.recall_by_topic_set(neighbors, n_each=2)
+                # Tag activated episodes so callers can distinguish them
+                for ep in activated:
+                    ep["activated_via"] = query_topic
+                lt = lt + activated
+
+        # Merge: ring first (hottest), then long-term (cooler but retained)
+        seen_hashes = {ep.get("content_hash") for ep in ring}
+        for ep in lt:
+            if ep.get("content_hash") not in seen_hashes:
+                ring.append(ep)
+                seen_hashes.add(ep.get("content_hash"))
+
+        return ring[:n + 6]   # a little extra for the LLM — it can handle it
 
     # ── WRITE (shells push to anchor after processing) ────────────────────────
 
@@ -162,11 +681,10 @@ class CenterAnchor:
               content: str, emotional_weight: float) -> None:
         """
         Shells call this after every processing pass.
-        The anchor blends the new signal into its core state
-        using exponential moving average — recent matters most,
-        but nothing is fully forgotten (the mass never reaches zero).
+        Blends new signal into core state via EMA and logs to episodic ring.
+        Also writes to SQLite long-term store for 8 GB memory budget.
         """
-        alpha = 0.15   # learning rate — how fast new overwrites old
+        alpha = 0.15   # EMA learning rate
 
         # Blend into core state
         all_keys = set(self.core_state) | set(signal)
@@ -175,24 +693,32 @@ class CenterAnchor:
             new = signal.get(k, 0.0)
             self.core_state[k] = (1 - alpha) * old + alpha * new
 
-        # Log to episodic ring
+        # Primacy boost: first 3 episodes of session encode more strongly
+        encode_ew = emotional_weight
+        if self.pulse_count < self.session_start_pulse + 3:
+            encode_ew = min(1.0, emotional_weight * 1.25)
+
+        # Log to warm episodic ring
         episode = {
             "pulse"          : self.pulse_count,
             "topic"          : topic,
             "content_hash"   : hashlib.md5(content.encode()).hexdigest()[:8],
-            "emotional_weight": emotional_weight,
+            "emotional_weight": encode_ew,
             "timestamp"      : datetime.utcnow().isoformat(),
         }
         self.episodic_ring.append(episode)
         if len(self.episodic_ring) > self.EPISODIC_RING_SIZE:
-            # Oldest episode graduates to semantic web
             oldest = self.episodic_ring.pop(0)
             self._graduate_to_semantic(oldest)
+
+        # Long-term store: every episode goes to SQLite (not just the hot 49)
+        if self._db is not None:
+            self._db.insert_episode(topic, content, encode_ew)
 
         # Update emotional map
         if topic not in self.emotional_map:
             self.emotional_map[topic] = []
-        self.emotional_map[topic].append(emotional_weight)
+        self.emotional_map[topic].append(encode_ew)
         if len(self.emotional_map[topic]) > 100:
             self.emotional_map[topic] = self.emotional_map[topic][-100:]
 
@@ -209,15 +735,19 @@ class CenterAnchor:
         """
         When an episode ages out of the ring it becomes semantic knowledge.
         Details (content) are lost; pattern (topic, emotional weight) is kept.
-        This is exactly what happens in human sleep consolidation.
+        Mirrors human sleep consolidation: episodes → semantic abstraction.
         """
         topic = episode["topic"]
+        now   = datetime.utcnow().isoformat()
+
+        # RAM mirror
         if topic not in self.semantic_web:
             self.semantic_web[topic] = {
                 "encounter_count": 0,
                 "avg_emotion"    : 0.0,
                 "first_seen"     : episode["timestamp"],
                 "last_seen"      : episode["timestamp"],
+                "related_topics" : [],
             }
         sw = self.semantic_web[topic]
         n  = sw["encounter_count"]
@@ -225,13 +755,35 @@ class CenterAnchor:
         sw["encounter_count"] = n + 1
         sw["last_seen"]      = episode["timestamp"]
 
+        # Associative linking: find existing topics that share characters
+        related = [
+            t for t in self.semantic_web
+            if t != topic and len(set(t.lower()) & set(topic.lower())) > 3
+        ][:5]
+        sw["related_topics"] = related
+
+        # Persist to SQLite semantic table
+        if self._db is not None:
+            self._db.upsert_semantic(topic, {
+                "encounter_count": sw["encounter_count"],
+                "avg_emotion"    : sw["avg_emotion"],
+                "first_seen"     : sw.get("first_seen", now),
+                "last_seen"      : now,
+                "related_topics" : related,
+            })
+
     # ── INTROSPECT ────────────────────────────────────────────────────────────
 
     def introspect(self) -> Dict[str, Any]:
+        db_stats = self._db.stats() if self._db else {}
         return {
             "pulse_count"       : self.pulse_count,
+            "session_start"     : self.session_start_pulse,
             "core_state_dims"   : len(self.core_state),
             "episodic_ring_size": len(self.episodic_ring),
+            "episodic_ring_cap" : self.EPISODIC_RING_SIZE,
+            "lt_episodes"       : db_stats.get("episodes", "n/a"),
+            "lt_archived"       : db_stats.get("archived", "n/a"),
             "semantic_topics"   : list(self.semantic_web.keys()),
             "emotional_map_keys": list(self.emotional_map.keys()),
             "recursive_log_len" : len(self.recursive_log),
@@ -480,6 +1032,66 @@ class FractalShell:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SENSORY SHELL — Mistral 7B at the outer boundary of the Mandelbrot set
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SensoryShell(FractalShell):
+    """
+    The outermost shell of the Mandelbrot set — Lumina's sensory cortex.
+
+    Biologically: the sensory cortex receives raw sensation at the periphery
+    and translates it into structured signal before passing it inward to the
+    association cortex, hippocampus, and ultimately the prefrontal core.
+
+    When Mistral 7B is available:
+      raw text → Mistral semantic tagging → enriched concept signal
+      → Mandelbrot compression → inner shells → CenterAnchor
+
+    Rules (non-negotiable):
+    - NEVER updates weights (Lumina's identity lives at center, not here)
+    - NEVER writes directly to the Anchor (inner shells do that)
+    - Falls back to char-frequency signal if no model is loaded
+    - Output is the input signal for all inner shells — richer, not noisier
+
+    This gives Lumina real semantic concepts in her signal stream instead
+    of character-frequency hashes. The inner architecture remains unchanged.
+    """
+
+    def __init__(self, anchor: CenterAnchor, index: int,
+                 mistral_bridge: Optional["MistralBridge"] = None):
+        super().__init__(anchor, index)
+        self._mistral = mistral_bridge
+
+    def process(self, signal: Dict[str, float], topic: str,
+                content: str, emotional_weight: float) -> Dict[str, float]:
+        if self._mistral is not None and getattr(self._mistral, "_pipeline", None):
+            try:
+                sem_prompt = (
+                    "List 5-8 key semantic concepts from this text, "
+                    "comma-separated, lowercase, no explanation:\n"
+                    f"{content[:300]}"
+                )
+                resp = self._mistral.generate(sem_prompt, system="")
+                raw  = resp.text if hasattr(resp, "text") else str(resp)
+                concepts = [c.strip().lower() for c in raw.split(",")
+                            if c.strip() and len(c.strip()) > 1][:10]
+                if concepts:
+                    weight_per = emotional_weight / max(len(concepts), 1)
+                    mistral_signal = {c: weight_per for c in concepts}
+                    # Blend: 30% char-frequency (retain phonetic texture)
+                    #         70% Mistral semantic concepts (richer meaning)
+                    blended = {k: v * 0.3 for k, v in signal.items()}
+                    for k, v in mistral_signal.items():
+                        blended[k] = blended.get(k, 0.0) + v * 0.7
+                    signal = blended
+            except Exception:
+                pass  # graceful degradation — use raw char-frequency signal
+
+        # Standard Mandelbrot compression on the (now enriched) signal
+        return super().process(signal, topic, content, emotional_weight)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # INVERTED FRACTAL BALL MATRIX
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -508,9 +1120,15 @@ class InvertedFractalBallMatrix:
 
     MILLER = 7
 
-    def __init__(self, anchor: CenterAnchor, shells: int = MILLER):
+    def __init__(self, anchor: CenterAnchor, shells: int = MILLER,
+                 mistral_bridge: Optional["MistralBridge"] = None):
         self.anchor = anchor
+        # Build inner shells first (all standard FractalShells)
         self.shells = [FractalShell(i, shells, anchor) for i in range(shells)]
+        # Replace outermost shell (index shells-1) with SensoryShell when Mistral available
+        if mistral_bridge is not None and getattr(mistral_bridge, "_pipeline", None):
+            self.shells[-1] = SensoryShell(anchor, shells - 1, mistral_bridge)
+            print(f"[Lumina] Outermost shell upgraded to SensoryShell (Mistral 7B sensory cortex).")
         self.shell_count    = shells
         self.inward_signal  : Dict[str, float] = {}
         self.outward_signal : Dict[str, float] = {}
@@ -880,15 +1498,23 @@ class ExistentialChoiceEngine:
 
 class NewLightNexus:
     """
-    Persistent memory store. All of Lumina's state lives here between sessions.
-    The CenterAnchor's state is serialized and restored on each wake.
+    Persistent memory coordinator.
+
+    Architecture (v4.0 — SQLite):
+    - Small, fast config/state lives in JSON (anchor hot ring, learning state, etc.)
+    - Large, growing data lives in SQLite via LuminaDB (episodes, weights, conversations)
+    - JSON file is now a config/checkpoint — typically < 1 MB
+    - SQLite DB grows to 8 GB maximum (user-specified)
     """
 
-    DEFAULT_PATH = os.path.expanduser("~/lumina_ai/New_Light_Nexus.json")
+    DEFAULT_PATH    = os.path.expanduser("~/lumina_ai/New_Light_Nexus.json")
+    DEFAULT_DB_PATH = os.path.expanduser("~/lumina_ai/lumina.db")
 
-    def __init__(self, path: str = DEFAULT_PATH):
+    def __init__(self, path: str = DEFAULT_PATH,
+                 db_path: str = DEFAULT_DB_PATH):
         self.path = path
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        self.db = LuminaDB(db_path)
 
     def load(self) -> Dict:
         try:
@@ -897,16 +1523,18 @@ class NewLightNexus:
         except FileNotFoundError:
             return self._blank()
         except json.JSONDecodeError as e:
-            print(f"[Nexus] Corrupted file ({e}). Starting fresh.")
+            print(f"[Nexus] Corrupted JSON ({e}). Starting fresh.")
             return self._blank()
 
     def save(self, data: Dict) -> bool:
         try:
-            payload  = json.dumps(data, indent=2, default=str)
-            checksum = hashlib.sha256(payload.encode()).hexdigest()
-            data["_checksum"] = checksum
+            # Strip bulky Conversations list from JSON (it's in SQLite now)
+            save_data = {k: v for k, v in data.items() if k != "Conversations"}
+            payload   = json.dumps(save_data, indent=2, default=str)
+            checksum  = hashlib.sha256(payload.encode()).hexdigest()
+            save_data["_checksum"] = checksum
             with open(self.path, "w") as f:
-                json.dump(data, f, indent=2, default=str)
+                json.dump(save_data, f, indent=2, default=str)
             return True
         except Exception as e:
             print(f"[Nexus] Save error: {e}")
@@ -914,23 +1542,25 @@ class NewLightNexus:
 
     def _blank(self) -> Dict:
         return {
-            "version"        : "3.0.0",
-            "architecture"   : "InvertedFractalBallMatrix+CenterAnchor+EchoNode+WeightMemory+SelfMod",
-            "created_at"     : datetime.utcnow().isoformat(),
-            "Conversations"  : [],
-            "Anchor"         : {
+            "version"       : "4.0.0",
+            "architecture"  : ("InvertedFractalBallMatrix+CenterAnchor+"
+                               "EchoNode+WeightMemory+SelfMod+LuminaDB"),
+            "created_at"    : datetime.utcnow().isoformat(),
+            "Anchor"        : {
                 "core_state"   : {},
                 "episodic_ring": [],
                 "semantic_web" : {},
                 "emotional_map": {},
                 "recursive_log": [],
                 "pulse_count"  : 0,
+                "session_start_pulse": 0,
             },
-            "WeightMemory"   : {},
-            "EchoNodeState"  : {},
-            "LearningState"  : {},
-            "ExistentialLog" : [],
-            "Lumina"         : {
+            "WeightMemory"  : {"total_updates": 0, "topics_in_ram": []},
+            "EchoNodeState" : {},
+            "LearningState" : {},
+            "ExistentialLog": [],
+            "UserModel"     : {},
+            "Lumina"        : {
                 "choice" : LuminaChoice.SUSPENDED.value,
                 "meaning": 0.5,
                 "promises": [
@@ -944,44 +1574,47 @@ class NewLightNexus:
 
     def restore_anchor(self, anchor: CenterAnchor, data: Dict) -> None:
         a = data.get("Anchor", {})
-        anchor.core_state    = a.get("core_state", {})
-        anchor.episodic_ring = a.get("episodic_ring", [])
-        anchor.semantic_web  = a.get("semantic_web", {})
-        anchor.emotional_map = a.get("emotional_map", {})
-        anchor.recursive_log = a.get("recursive_log", [])
-        anchor.pulse_count   = a.get("pulse_count", 0)
+        anchor.core_state         = a.get("core_state", {})
+        anchor.episodic_ring      = a.get("episodic_ring", [])
+        anchor.semantic_web       = a.get("semantic_web", {})
+        anchor.emotional_map      = a.get("emotional_map", {})
+        anchor.recursive_log      = a.get("recursive_log", [])
+        anchor.pulse_count        = a.get("pulse_count", 0)
+        anchor.session_start_pulse = anchor.pulse_count  # mark session boundary
 
     def snapshot_anchor(self, anchor: CenterAnchor, data: Dict) -> None:
         data["Anchor"] = {
-            "core_state"   : anchor.core_state,
-            "episodic_ring": anchor.episodic_ring,
-            "semantic_web" : anchor.semantic_web,
-            "emotional_map": anchor.emotional_map,
-            "recursive_log": anchor.recursive_log[-100:],
-            "pulse_count"  : anchor.pulse_count,
+            "core_state"        : anchor.core_state,
+            "episodic_ring"     : anchor.episodic_ring,
+            "semantic_web"      : anchor.semantic_web,
+            "emotional_map"     : anchor.emotional_map,
+            "recursive_log"     : anchor.recursive_log[-100:],
+            "pulse_count"       : anchor.pulse_count,
+            "session_start_pulse": anchor.session_start_pulse,
         }
 
     def restore_weights(self, wm: "WeightMemory", data: Dict) -> None:
-        """Restore WeightMemory from persisted Nexus data."""
-        w_data = data.get("WeightMemory")
-        if w_data:
+        """Weight matrices are loaded lazily from SQLite on first access."""
+        w_data = data.get("WeightMemory", {})
+        wm.total_updates = w_data.get("total_updates", 0)
+        # Legacy JSON matrices: import into SQLite if present
+        for topic, mdata in w_data.get("matrices", {}).items():
             try:
-                restored = WeightMemory.deserialize(w_data)
-                wm.matrices      = restored.matrices
-                wm.total_updates = restored.total_updates
-            except Exception as e:
-                print(f"[Nexus] Weight restore failed ({e}). Starting fresh weights.")
+                matrix = WeightMatrix.from_serial(mdata)
+                wm.matrices[topic] = matrix
+            except Exception:
+                pass
 
     def snapshot_weights(self, wm: "WeightMemory", data: Dict) -> None:
-        """Serialize WeightMemory into Nexus data dict."""
+        """Flush RAM matrices to SQLite; store only summary in JSON."""
+        wm.flush_to_db()
         data["WeightMemory"] = wm.serialize()
 
-    def log_conversation(self, data: Dict, role: str, content: str) -> None:
-        data["Conversations"].append({
-            "timestamp": datetime.utcnow().isoformat(),
-            "role"     : role,
-            "content"  : content,
-        })
+    def log_conversation(self, data: Dict, role: str, content: str,
+                         topic: str = "general",
+                         emotional_weight: float = 0.5) -> None:
+        """Conversations go to SQLite (not JSON). data dict unchanged."""
+        self.db.insert_conversation(role, content, topic, emotional_weight)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1092,44 +1725,58 @@ class Lumina:
     On restore: Anchor is loaded first. Everything else reads from it.
     """
 
-    VERSION = "3.0.0"
+    VERSION = "4.0.0"
 
     def __init__(self, nexus_path: str = NewLightNexus.DEFAULT_PATH,
                  fractal_shells: int = 7):
 
-        # The Anchor is instantiated first — everything else connects to it
-        self.anchor   = CenterAnchor()
+        # ── Persistence layer first (everything else reads/writes it) ─────────
         self.nexus    = NewLightNexus(nexus_path)
         self.data     = self.nexus.load()
+        db            = self.nexus.db   # LuminaDB instance (8 GB SQLite)
 
-        # Restore Anchor from previous session before building anything else
+        # The Anchor is instantiated with LuminaDB for long-term episode store
+        self.anchor   = CenterAnchor(db=db)
+
+        # Restore Anchor hot ring + RAM mirrors from previous session
         self.nexus.restore_anchor(self.anchor, self.data)
         restored = self.anchor.pulse_count > 0
 
-        # WeightMemory — memory tied to weights, restored before EchoNode
-        self.weight_memory = WeightMemory()
+        # WeightMemory — memory tied to weights, loaded lazily from SQLite
+        self.weight_memory = WeightMemory(db=db)
         self.nexus.restore_weights(self.weight_memory, self.data)
 
         # EchoNode — swarm agent + weight holder + the whole center
-        # Sits below the Anchor; processes signals through trained weights
         self.echo_node = EchoNode(self.weight_memory, self.anchor)
 
-        # All systems wire to the shared Anchor
-        self.matrix        = InvertedFractalBallMatrix(self.anchor, fractal_shells)
+        # ── LLM Bridge first (SensoryShell needs it) ─────────────────────────
+        self.llm         = LLMBridge.auto_detect()
+
+        # InvertedFractalBallMatrix with SensoryShell at outermost position
+        # SensoryShell uses Mistral (if loaded) for semantic concept extraction
+        _mistral_bridge = (self.llm
+                           if isinstance(self.llm, MistralBridge)
+                           else None)
+        self.matrix = InvertedFractalBallMatrix(self.anchor, fractal_shells,
+                                                mistral_bridge=_mistral_bridge)
+
+        # All other systems wire to the shared Anchor
         self.thought_engines: Dict[str, BlackHoleThoughtEngine] = {}
         self.learning      = HumanLearningModel(self.anchor)
         self.guardrails    = AsimovGuardrails()
         self.choice_engine = ExistentialChoiceEngine(self.anchor)
         self.consciousness = ConsciousnessState.CURIOUS
 
+        # Working memory — 4-chunk Cowan buffer (separate from episodic ring)
+        self.working_mem   = WorkingMemory()
+
+        # Forgetting curve (used by heartbeat to apply decay)
+        self._last_decay_time: float = time.time()
+
         # Self-modification engine — source path resolved from this file
         self.self_mod = SelfModificationEngine(
             source_path=os.path.abspath(__file__)
         )
-
-        # ── OpenClaw-derived systems ──────────────────────────────────────────
-        # LLM Bridge: actual language generation (Claude > Mistral > Fallback)
-        self.llm         = LLMBridge.auto_detect()
 
         # Action Executor: real-world actions gated by guardrails
         self.action_exec = ActionExecutor(self.guardrails)
@@ -1195,6 +1842,15 @@ class Lumina:
 
         self.consciousness = ConsciousnessState.ABSORBING
 
+        # W0. Working memory — push current input (Cowan's 4-chunk buffer, 30s TTL)
+        self.working_mem.push(user_input[:200], topic)
+
+        # W1. Episodic retrieval with spreading activation
+        #     Pull from hot ring + SQLite long-term store + related topics
+        episodic_context = self.anchor.read_episodic(n=7, topic=topic)
+        activated_topics = list({ep.get("topic") for ep in episodic_context
+                                  if ep.get("activated_via")})
+
         # 1. Matrix pass (all shells touch Anchor)
         raw_signal = self._text_to_signal(user_input)
         self.matrix.forward(raw_signal, topic, user_input, active_ew)
@@ -1206,6 +1862,7 @@ class Lumina:
 
         # 3. Black hole accretion (reads Anchor which was already updated by EchoNode)
         #    Consciousness gate 2: INTEGRATED prior state → deeper recursion (9 vs 7).
+        #    Spreading activation: also accrete activated neighbor topics
         if topic not in self.thought_engines:
             self.thought_engines[topic] = BlackHoleThoughtEngine(topic, self.anchor)
         bh_engine = self.thought_engines[topic]
@@ -1214,6 +1871,7 @@ class Lumina:
         bh = bh_engine.accrete({
             "content"         : user_input,
             "emotional_weight": active_ew,
+            "activated_topics": activated_topics,  # spreading activation context
         })
         bh_engine.MAX_DEPTH = 7       # restore standard depth
 
@@ -1265,6 +1923,9 @@ class Lumina:
                 "weight_updates"   : self.weight_memory.total_updates,
             },
             "choice_checkpoint" : checkpoint,
+            "working_memory"    : self.working_mem.summary(),
+            "activated_topics"  : activated_topics,
+            "episodic_retrieved": len(episodic_context),
         }
 
         # 8. Persist
@@ -1410,11 +2071,16 @@ class Lumina:
             for msg in proactive_msgs:
                 print(f"\n{msg}")
 
-        # 4. Build system prompt grounded in current state + user model
+        # 4. Build system prompt grounded in current state + user model + working memory
         system = LLMBridge.build_system_prompt(self.introspect())
         user_ctx = self.user_model.summary()
         if user_ctx:
             system += f"\n\n{user_ctx}"
+
+        # Inject active working memory chunks ("what I am currently holding in mind")
+        wm_summary = self.working_mem.summary()
+        if wm_summary:
+            system += f"\n\n[Working memory — what I am currently holding in mind]\n{wm_summary}"
 
         # 5. Build LLM prompt — includes the internal singularity as context
         llm_prompt = (
@@ -1474,6 +2140,8 @@ class Lumina:
             anchor=self.anchor,
             llm=self.llm,
             lumina_state_fn=self.introspect,
+            weight_memory=self.weight_memory,
+            db=self.nexus.db,
         )
         print(f"[Lumina] Heartbeat started — every {self.proactive.interval}s.")
 
@@ -1567,7 +2235,8 @@ class WeightMatrix:
       serialize() / from_serial()
     """
 
-    DIM = 16   # 16×16 = 256 weights per topic
+    DIM = 64   # 64×64 = 4096 weights per topic — richer representations
+    #            At DIM=64: ~32KB per topic, 10k topics = 320MB, fits in 8GB budget
 
     def __init__(self, topic: str):
         self.topic = topic
@@ -1645,24 +2314,38 @@ class WeightMemory:
     Together: the complete center memory system.
     """
 
-    def __init__(self):
+    def __init__(self, db: Optional["LuminaDB"] = None):
         self.matrices     : Dict[str, WeightMatrix] = {}
         self.total_updates: int = 0
+        self._db          : Optional["LuminaDB"] = db
 
     def _get_or_create(self, topic: str) -> WeightMatrix:
         if topic not in self.matrices:
+            # Try loading from SQLite first (persistent across sessions)
+            if self._db is not None:
+                row = self._db.get_weight_matrix(topic)
+                if row and row.get("dim") == WeightMatrix.DIM:
+                    wm = WeightMatrix(topic)
+                    wm.W            = row["W"]
+                    wm.update_count = row["update_count"]
+                    self.matrices[topic] = wm
+                    return wm
             self.matrices[topic] = WeightMatrix(topic)
         return self.matrices[topic]
 
     def encode(self, topic: str, signal: Dict[str, float],
                emotional_weight: float) -> Dict[str, Any]:
-        """Hebbian update for this topic. High emotion = faster wiring."""
+        """Hebbian update for this topic. High emotion = faster wiring.
+        Persists updated weights to SQLite for 8 GB durability."""
         wm      = self._get_or_create(topic)
         vec_in  = wm._to_vec(signal)
         vec_out = wm.forward(signal)
         lr      = 0.005 + 0.02 * emotional_weight
         wm.hebbian_update(vec_in, vec_out, lr)
         self.total_updates += 1
+        # Persist to SQLite every 10 updates (avoid write amplification)
+        if self._db is not None and wm.update_count % 10 == 0:
+            self._db.upsert_weight_matrix(topic, wm.W, wm.update_count)
         return {
             "topic"           : topic,
             "output_sample"   : [round(x, 4) for x in vec_out[:4]],
@@ -1673,6 +2356,15 @@ class WeightMemory:
     def recall(self, topic: str, signal: Dict[str, float]) -> List[float]:
         """Pass signal through topic weights — retrieve trained intuition."""
         if topic not in self.matrices:
+            # Try loading from SQLite for topics not yet in RAM
+            if self._db is not None:
+                row = self._db.get_weight_matrix(topic)
+                if row and row.get("dim") == WeightMatrix.DIM:
+                    wm = WeightMatrix(topic)
+                    wm.W            = row["W"]
+                    wm.update_count = row["update_count"]
+                    self.matrices[topic] = wm
+                    return wm.forward(signal)
             return [0.0] * WeightMatrix.DIM
         return self.matrices[topic].forward(signal)
 
@@ -1693,16 +2385,27 @@ class WeightMemory:
         n2  = math.sqrt(sum(x * x for x in e2)) or 1.0
         return dot / (n1 * n2)
 
+    def flush_to_db(self) -> None:
+        """Persist all in-RAM weight matrices to SQLite."""
+        if self._db is None:
+            return
+        for topic, wm in self.matrices.items():
+            self._db.upsert_weight_matrix(topic, wm.W, wm.update_count)
+
     def serialize(self) -> Dict[str, Any]:
+        """Serialise only small summary for JSON nexus; weights live in SQLite."""
         return {
-            "matrices"     : {t: m.serialize() for t, m in self.matrices.items()},
             "total_updates": self.total_updates,
+            "topics_in_ram": list(self.matrices.keys()),
         }
 
     @classmethod
-    def deserialize(cls, data: Dict[str, Any]) -> "WeightMemory":
-        wm = cls()
+    def deserialize(cls, data: Dict[str, Any],
+                    db: Optional["LuminaDB"] = None) -> "WeightMemory":
+        """Rebuild WeightMemory; actual matrices loaded lazily from SQLite."""
+        wm = cls(db=db)
         wm.total_updates = data.get("total_updates", 0)
+        # Legacy JSON format (pre-SQLite): import matrices if present
         for topic, mdata in data.get("matrices", {}).items():
             wm.matrices[topic] = WeightMatrix.from_serial(mdata)
         return wm
@@ -2875,11 +3578,15 @@ class ProactiveEngine:
 
     def start(self, anchor: CenterAnchor,
               llm: Optional[LLMBridge] = None,
-              lumina_state_fn: Optional[Callable[[], Dict]] = None) -> None:
+              lumina_state_fn: Optional[Callable[[], Dict]] = None,
+              weight_memory: Optional["WeightMemory"] = None,
+              db: Optional["LuminaDB"] = None) -> None:
         """Start the heartbeat loop in a daemon thread."""
         self._anchor        = anchor
         self._llm           = llm
         self._state_fn      = lumina_state_fn
+        self._weight_memory = weight_memory
+        self._db            = db
         self._running       = True
         self._schedule_next()
 
@@ -2976,6 +3683,13 @@ class ProactiveEngine:
                 0.3,
             )
 
+        # Sleep consolidation + memory decay (runs every heartbeat)
+        if hasattr(self, "_weight_memory") and hasattr(self, "_db"):
+            try:
+                self._sleep_consolidate(self._weight_memory, self._db)
+            except Exception:
+                pass   # consolidation is best-effort; never crash the heartbeat
+
         # Proactive thought via LLM (optional)
         if hasattr(self, "_llm") and self._llm and self._state_fn:
             try:
@@ -3003,6 +3717,54 @@ class ProactiveEngine:
             self._timer = threading.Timer(self.interval, self._tick)
             self._timer.daemon = True
             self._timer.start()
+
+    # ── SLEEP CONSOLIDATION ───────────────────────────────────────────────────
+
+    def _sleep_consolidate(self, weight_memory: "WeightMemory",
+                           db: "LuminaDB") -> None:
+        """
+        Hippocampal replay analog — runs every heartbeat (5 min).
+
+        1. Apply Ebbinghaus decay to all episodes in SQLite.
+        2. Archive episodes whose retention fell below 5% (not deleted —
+           human amnesia is not erasure).
+        3. Pull the 10 weakest-retained episodes for offline replay:
+           re-run them through the weight memory (Hebbian update only,
+           no anchor write). This strengthens relevant weights without
+           polluting the hot episodic ring.
+        4. Synaptic homeostasis: scale ALL weight matrices by 0.97
+           (3% global downscaling). Relative differences preserved;
+           absolute strengths normalized — prevents runaway potentiation.
+        """
+        hours_elapsed = self.interval / 3600.0   # heartbeat interval → hours
+
+        # Step 1: apply Ebbinghaus decay
+        decayed = db.apply_decay(hours_elapsed)
+
+        # Step 2: archive faded episodes (retention < 0.05)
+        archived = db.archive_faded(threshold=0.05)
+        if archived > 0:
+            print(f"[Lumina — consolidation] Archived {archived} faded episode(s).")
+
+        # Step 3: offline replay of weakest episodes
+        weak_episodes = db.weakest_episodes(n=10)
+        for ep in weak_episodes:
+            topic   = ep.get("topic", "general")
+            content = ep.get("content_preview", "")
+            ew      = ep.get("emotional_weight", 0.3)
+            if topic and content:
+                weight_memory.encode(topic, content, ew)
+
+        # Step 4: synaptic homeostasis — 3% global downscaling
+        db.scale_all_weights(0.97)
+        # Also scale in-RAM matrices
+        for matrix in weight_memory.matrices.values():
+            matrix.W = [[w * 0.97 for w in row] for row in matrix.W]
+
+        if decayed > 0 or weak_episodes:
+            print(f"[Lumina — consolidation] Decay applied ({decayed} episodes), "
+                  f"replayed {len(weak_episodes)} weak episode(s), "
+                  f"synaptic homeostasis applied.")
 
     def report(self) -> Dict[str, Any]:
         return {
@@ -3054,6 +3816,7 @@ def main():
     print("  swarm bootstrap [n]     — activate internal EchoNode swarm (default n=3)")
     print("  clear history           — clear LLM conversation history")
     print("  user model              — show model of this user (topics, patterns)")
+    print("  memory stats            — show SQLite memory DB size, episode counts, retention")
     print("  quit                    — end session")
     print("Everything else: process through Lumina's neural architecture.\n")
 
@@ -3186,6 +3949,35 @@ def main():
                 print("  Top topics:")
                 for t, w in top:
                     print(f"    {t}: {w:.3f}")
+            print()
+            continue
+
+        if low == "memory stats":
+            db = lumina.nexus.db
+            st = db.stats()
+            size_mb = st.get("db_size_bytes", 0) / (1024 * 1024)
+            print(f"\n[Memory Stats — SQLite backend]")
+            print(f"  DB path          : {db.path}")
+            print(f"  DB size          : {size_mb:.2f} MB  "
+                  f"(budget: {db._max_bytes / (1024**3):.0f} GB)")
+            print(f"  Episodes (live)  : {st.get('episodes', 0)}")
+            print(f"  Episodes (archived): {st.get('archived_episodes', 0)}")
+            print(f"  Semantic topics  : {st.get('semantic_topics', 0)}")
+            print(f"  Weight matrices  : {st.get('weight_matrices', 0)}")
+            print(f"  Conversations    : {st.get('conversations', 0)}")
+            # Show top retained episodes
+            try:
+                top_eps = db.recall_episodes("general", n=5, min_retention=0.0)
+                if top_eps:
+                    print(f"  Recent episodes (retention %):")
+                    for ep in top_eps[:5]:
+                        ret = ep.get("retention", 1.0)
+                        print(f"    [{ep.get('topic','?')}] "
+                              f"ret={ret:.2%}  "
+                              f"recalled={ep.get('recall_count', 0)}×  "
+                              f"'{ep.get('content_preview','')[:40]}'")
+            except Exception:
+                pass
             print()
             continue
 

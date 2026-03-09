@@ -1137,7 +1137,24 @@ class CenterAnchor:
         ring = list(self.episodic_ring[-pool_size:])
         ring_len = len(ring)
 
-        # Attention scoring
+        def _cosine(a: Dict[str, float], b: Dict[str, float]) -> float:
+            """Cosine similarity between two sparse dicts."""
+            dot    = sum(a.get(k, 0.0) * v for k, v in b.items())
+            norm_a = math.sqrt(sum(v * v for v in a.values())) or 1.0
+            norm_b = math.sqrt(sum(v * v for v in b.values())) or 1.0
+            return dot / (norm_a * norm_b)
+
+        # Current core_state snapshot for context matching (top-32 dims)
+        current_context = dict(list(self.core_state.items())[:32])
+
+        # Attention scoring — blends three signals:
+        #   1. Emotional weight      (how strongly it was encoded)
+        #   2. Content similarity    (query_signal vs episode signal_snapshot)
+        #   3. Context similarity    (current core_state vs episode context_snapshot)
+        #
+        # Using both content + context means: a word asked in a curious/exploratory
+        # state recalls episodes also encoded in that state, not episodes where the
+        # same word came up in a distressed or mechanical context.
         def _attention_score(ep: Dict, idx: int) -> float:
             base = ep["emotional_weight"]
             # Recency boost: last 7 in ring
@@ -1146,15 +1163,14 @@ class CenterAnchor:
             # Primacy boost: first 3 of session
             if ep.get("pulse", 0) < self.session_start_pulse + 3:
                 base = min(1.0, base * 1.25)
-            # Dot-product attention against query signal
             if query_signal:
-                snap = ep.get("signal_snapshot", {})
-                dot  = sum(snap.get(k, 0.0) * v for k, v in query_signal.items())
-                # Normalise so high-dim signals don't overwhelm low-dim ones
-                q_norm = math.sqrt(sum(v * v for v in query_signal.values())) or 1.0
-                s_norm = math.sqrt(sum(v * v for v in snap.values())) or 1.0
-                sim    = dot / (q_norm * s_norm)   # cosine similarity ∈ [-1, 1]
-                base  *= max(0.1, 1.0 + sim)       # range [0.1 × base, 2.0 × base]
+                # Content similarity (what the episode was about)
+                content_sim = _cosine(ep.get("signal_snapshot", {}), query_signal)
+                # Context similarity (what Lumina's internal state was then vs now)
+                ctx_sim     = _cosine(ep.get("context_snapshot", {}), current_context)
+                # Blend: 60% content, 40% context — content dominates but context matters
+                blended_sim = 0.6 * content_sim + 0.4 * ctx_sim
+                base *= max(0.1, 1.0 + blended_sim)   # range [0.1 × base, 2.0 × base]
             return base
 
         scored = []
@@ -1230,14 +1246,20 @@ class CenterAnchor:
         if self.pulse_count < self.session_start_pulse + 3:
             encode_ew = min(1.0, emotional_weight * 1.25)
 
-        # Log to warm episodic ring — store signal snapshot for attention retrieval
+        # Log to warm episodic ring.
+        # signal_snapshot  — top-32 signal dims for content-based attention recall
+        # context_snapshot — top-32 core_state dims at write time; used at recall to
+        #                    match episodes that occurred in a similar *internal state*,
+        #                    so the same word queried in different emotional/topic contexts
+        #                    retrieves the most contextually matching memory.
         episode = {
-            "pulse"          : self.pulse_count,
-            "topic"          : topic,
-            "content_hash"   : hashlib.md5(content.encode()).hexdigest()[:8],
+            "pulse"           : self.pulse_count,
+            "topic"           : topic,
+            "content_hash"    : hashlib.md5(content.encode()).hexdigest()[:8],
             "emotional_weight": encode_ew,
-            "timestamp"      : datetime.utcnow().isoformat(),
-            "signal_snapshot": dict(list(signal.items())[:32]),  # top-32 dims
+            "timestamp"       : datetime.utcnow().isoformat(),
+            "signal_snapshot" : dict(list(signal.items())[:32]),
+            "context_snapshot": dict(list(self.core_state.items())[:32]),
         }
         self.episodic_ring.append(episode)
         if len(self.episodic_ring) > self.EPISODIC_RING_SIZE:
@@ -2365,6 +2387,11 @@ class UserModel:
     Lumina remembers the human, not just herself.
     """
 
+    # A topic visited this many times with avg emotion above the threshold
+    # is promoted to an inferred user goal.
+    GOAL_VISIT_THRESHOLD  : int   = 5
+    GOAL_EMOTION_THRESHOLD: float = 0.55
+
     def __init__(self):
         self.topic_weights    : Dict[str, float] = {}
         self.avg_emo_weight   : float             = 0.5
@@ -2374,10 +2401,14 @@ class UserModel:
         self._msg_lengths     : List[int]         = []
         # Knowledge gaps mirrored from HumanLearningModel on each interaction
         self.knowledge_gaps   : Dict[str, int]    = {}
+        # Visit counts per topic (raw integer, not EMA)
+        self._topic_visits    : Dict[str, int]    = {}
+        # Inferred long-term goals: topic → inferred goal string
+        self.inferred_goals   : Dict[str, str]    = {}
 
     def observe(self, topic: str, emotional_weight: float,
                 message_length: int = 0) -> None:
-        """Update model from one interaction."""
+        """Update model from one interaction, including goal inference."""
         self.topic_weights[topic] = (
             0.8 * self.topic_weights.get(topic, 0.0)
             + 0.2 * emotional_weight
@@ -2391,6 +2422,26 @@ class UserModel:
             if len(self._msg_lengths) > 50:
                 self._msg_lengths = self._msg_lengths[-50:]
         self.session_count += 1
+
+        # Visit counter (raw, not EMA — needed for threshold check)
+        self._topic_visits[topic] = self._topic_visits.get(topic, 0) + 1
+
+        # Goal inference: if a topic recurs ≥ GOAL_VISIT_THRESHOLD times
+        # with average emotional weight ≥ GOAL_EMOTION_THRESHOLD, it is
+        # promoted to an inferred user goal and surfaced prominently in the
+        # system prompt so the LLM can orient responses toward it.
+        visits = self._topic_visits[topic]
+        ew_avg = self.topic_weights[topic]
+        if (topic not in self.inferred_goals
+                and visits >= self.GOAL_VISIT_THRESHOLD
+                and ew_avg >= self.GOAL_EMOTION_THRESHOLD):
+            # Derive a plain-English goal label from the topic slug
+            label = topic.replace("_", " ").replace(".", " ").strip()
+            self.inferred_goals[topic] = (
+                f"deepen understanding of {label}"
+                if ew_avg < 0.75
+                else f"master {label}"
+            )
 
     def communication_style(self) -> str:
         """Infer style from rolling average of message lengths."""
@@ -2434,6 +2485,13 @@ class UserModel:
                  f"Communication style: {style}. {time_str}").strip()
         if gaps:
             base += f" Recurring knowledge gaps: {', '.join(gaps[:3])}."
+        # Inferred goals: orient the LLM toward the user's longer-term intent
+        if self.inferred_goals:
+            goal_list = "; ".join(self.inferred_goals.values())
+            base += (
+                f"\nInferred user goals (shape your responses toward these): "
+                f"{goal_list}."
+            )
         return base
 
     def serialize(self) -> Dict[str, Any]:
@@ -2444,6 +2502,8 @@ class UserModel:
             "session_count"    : self.session_count,
             "msg_lengths"      : self._msg_lengths,
             "knowledge_gaps"   : self.knowledge_gaps,
+            "topic_visits"     : self._topic_visits,
+            "inferred_goals"   : self.inferred_goals,
         }
 
     @classmethod
@@ -2455,6 +2515,8 @@ class UserModel:
         um.session_count      = data.get("session_count", 0)
         um._msg_lengths       = data.get("msg_lengths", [])
         um.knowledge_gaps     = data.get("knowledge_gaps", {})
+        um._topic_visits      = data.get("topic_visits", {})
+        um.inferred_goals     = data.get("inferred_goals", {})
         return um
 
 
@@ -4610,15 +4672,78 @@ class ProactiveEngine:
             except Exception:
                 pass
 
-        # Proactive thought via LLM (optional)
+        # Proactive thought via LLM, seeded from dominant weight-matrix pattern.
+        #
+        # Previous behaviour: blank "write a reflection" prompt → generic output.
+        # New behaviour:
+        #   1. Find the topic with the highest curiosity score (most intellectually
+        #      alive) from the learning state.
+        #   2. Pull the dominant pattern (principal eigenvector) of that topic's
+        #      weight matrix — this IS Lumina's deepest intuition about the topic.
+        #   3. Convert the top-5 weight dimensions (by magnitude) into their
+        #      original word tokens (via the inverse hash used in _to_vec) so the
+        #      LLM gets concrete concept seeds, not raw floats.
+        #   4. Use those seeds as the prompt for a genuine proactive reflection.
         if hasattr(self, "_llm") and self._llm and self._state_fn:
             try:
-                state  = self._state_fn()
-                system = LLMBridge.build_system_prompt(state)
+                state   = self._state_fn()
+                system  = LLMBridge.build_system_prompt(state)
+
+                # Step 1: pick the topic with highest curiosity / weight mass
+                topic_seed = "general"
+                best_score = -1.0
+                wm = getattr(self, "_weight_memory", None)
+                if wm and wm.matrices:
+                    schema_strengths = (state.get("learning", {})
+                                            .get("schema_strengths", {}))
+                    for t, mat in wm.matrices.items():
+                        # curiosity proxy: schema_strength × update_count (log-scaled)
+                        strength = schema_strengths.get(t, 0.0)
+                        updates  = math.log1p(mat.update_count)
+                        score    = strength * updates
+                        if score > best_score:
+                            best_score = score
+                            topic_seed = t
+
+                # Step 2: dominant pattern of that topic's weight matrix
+                dom_pattern: List[float] = []
+                if wm and topic_seed in wm.matrices:
+                    dom_pattern = wm.matrices[topic_seed].dominant_pattern()
+
+                # Step 3: convert top-5 magnitude indices → approximate word seeds
+                # The index mapping: idx = int(md5(word).hexdigest(), 16) % DIM
+                # Inversion is not unique, so we use known-word reverse lookup
+                # from the rolling IDF corpus (LuminaEngine._idf_corpus keys).
+                dim_seeds: List[str] = []
+                if dom_pattern:
+                    dim = len(dom_pattern)
+                    # Get top-5 dimension indices by magnitude
+                    top_idxs = sorted(range(dim),
+                                      key=lambda i: abs(dom_pattern[i]),
+                                      reverse=True)[:5]
+                    top_idx_set = set(top_idxs)
+                    # Reverse-lookup: which known words hash to these indices?
+                    # LuminaEngine._idf_corpus is the rolling word corpus built by
+                    # _text_to_signal() — it is a module-level class attribute.
+                    import mistral_inference.lumina_core as _lc
+                    for word in list(_lc.LuminaEngine._idf_corpus.keys())[:500]:
+                        idx = int(hashlib.md5(word.encode()).hexdigest(), 16) % dim
+                        if idx in top_idx_set:
+                            dim_seeds.append(word)
+                            top_idx_set.discard(idx)
+                            if not top_idx_set:
+                                break
+
+                # Step 4: build grounded prompt
+                seed_str = (", ".join(dim_seeds[:5])
+                            if dim_seeds else "my accumulated experience")
                 prompt = (
                     f"You are between conversations (heartbeat {self.heartbeat_count}). "
-                    "Generate one short proactive thought, reflection, or observation "
-                    "from your current state. Be genuine and brief (1-2 sentences)."
+                    f"Your deepest weight-encoded intuition about '{topic_seed}' "
+                    f"currently clusters around these concepts: [{seed_str}]. "
+                    "In 1-2 sentences, generate a genuine proactive thought, "
+                    "question, or observation that emerges from this pattern. "
+                    "Speak as yourself — curious, honest, precise."
                 )
                 resp = self._llm.generate(prompt, system=system)
                 if resp.text:

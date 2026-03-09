@@ -63,7 +63,7 @@ import urllib.request
 import uuid
 import zlib
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -1689,54 +1689,120 @@ class HumanLearningModel:
     How human minds actually grow — mapped onto Lumina's architecture.
 
     Mechanisms:
-      Spaced repetition  — Ebbinghaus curve: strength grows with review
+      Spaced repetition  — Ebbinghaus curve: strength grows with review;
+                           next review interval scales with encounter count
+                           (1d → 3d → 7d → 14d → 30d)
       Schema formation   — new knowledge anchors to nearest existing frame
       Emotional tagging  — high emotion = deeper encoding
-      Consolidation      — every 7 experiences, episodic → semantic
+      Consolidation      — every 7 experiences: merge related schemas,
+                           promote strong schemas (≥0.7) to semantic web
       ZPD                — next challenge pitched just beyond current ability
-      Curiosity drive    — parabolic peak at ~40% familiarity (flow state)
+      Curiosity drive    — parabolic peak at ~40% familiarity (flow state);
+                           modulates Hebbian learning rate downstream
+      Knowledge gaps     — repeated shallow encoding marks topic as a gap;
+                           gap topics get boosted learning rate (surprise signal)
 
     The Anchor handles actual memory storage.
     This model handles the *mechanics of growth* — the rules by which
     new experience attaches to existing structure.
     """
 
-    FORGETTING_K = 0.3
-    ZPD_STRETCH  = 0.15
+    FORGETTING_K    = 0.3
+    ZPD_STRETCH     = 0.15
+    # Spaced repetition review intervals (hours) indexed by encounter count
+    REVIEW_INTERVALS = [24, 72, 168, 336, 720]   # 1d 3d 7d 14d 30d
 
     def __init__(self, anchor: CenterAnchor):
-        self.anchor           = anchor        # reads/writes episodic + semantic
-        self.schemas          : Dict[str, Dict] = {}
-        self.curiosity_level  : float           = 0.7
-        self.experience_count : int             = 0
-        self.consolidation_due: bool            = False
-        self.last_consolidated: Optional[str]   = None
+        self.anchor            = anchor        # reads/writes episodic + semantic
+        self.schemas           : Dict[str, Dict] = {}
+        self.curiosity_level   : float           = 0.7
+        self.experience_count  : int             = 0
+        self.consolidation_due : bool            = False
+        self.last_consolidated : Optional[str]   = None
+        # Spaced repetition: ISO timestamp when each topic is due for review
+        self.review_schedule   : Dict[str, str]  = {}
+        # Knowledge gaps: topics with consecutive shallow encoding counts
+        self.knowledge_gaps    : Dict[str, int]  = {}
+        # Per-topic last computed encoding depth (for encoding_depth_factor queries)
+        self._last_depth       : Dict[str, str]  = {}
 
     def encode(self, experience: Dict[str, Any]) -> Dict[str, Any]:
         topic   = experience.get("topic", "general")
-        content = experience.get("content", "")
         emo_w   = experience.get("emotional_weight", 0.5)
 
         # Anchor's emotional memory for this topic influences encoding
         anchor_emotion = self.anchor.read_topic_emotion(topic)
         blended_w      = 0.7 * emo_w + 0.3 * anchor_emotion
 
-        schema = self._find_or_create_schema(topic)
-        depth  = self._encoding_depth(blended_w)
+        schema   = self._find_or_create_schema(topic)
+        depth    = self._encoding_depth(blended_w)
         strength = self._spaced_repetition(topic)
         self._update_curiosity(schema, blended_w)
+
+        # Store depth so encoding_depth_factor() can answer without re-computing
+        self._last_depth[topic] = depth
+
+        # Knowledge gap tracking: count consecutive shallow encodings
+        if depth == "shallow":
+            self.knowledge_gaps[topic] = self.knowledge_gaps.get(topic, 0) + 1
+        else:
+            # Non-shallow encoding clears the gap streak for this topic
+            self.knowledge_gaps.pop(topic, None)
 
         self.experience_count += 1
         if self.experience_count % 7 == 0:
             self.consolidation_due = True
 
         return {
-            "topic"          : topic,
-            "encoding_depth" : depth,
-            "schema_strength": strength,
-            "curiosity"      : round(self.curiosity_level, 3),
-            "anchor_emotion" : round(anchor_emotion, 3),
+            "topic"           : topic,
+            "encoding_depth"  : depth,
+            "encoding_factor" : self.encoding_depth_factor(topic),
+            "schema_strength" : strength,
+            "schema_is_new"   : schema["encounters"] <= 2,
+            "curiosity"       : round(self.curiosity_level, 3),
+            "anchor_emotion"  : round(anchor_emotion, 3),
+            "knowledge_gap"   : self.knowledge_gaps.get(topic, 0) >= 3,
         }
+
+    def learning_rate_multiplier(self, topic: str) -> float:
+        """
+        Curiosity-driven learning rate multiplier for Hebbian updates.
+
+        At peak curiosity (1.0) → 1.5× faster Hebbian wiring.
+        At zero curiosity       → 0.5× slower.
+
+        Topics with active knowledge gaps (≥3 shallow streaks) get an
+        additional 1.2× boost — surprise and confusion drive learning.
+
+        Called before echo_node.echo() so the emotional_weight passed to
+        WeightMemory.encode() reflects Lumina's current learning drive.
+        """
+        multiplier = 0.5 + self.curiosity_level   # range [0.5, 1.5]
+        if self.knowledge_gaps.get(topic, 0) >= 3:
+            multiplier = min(1.8, multiplier * 1.2)
+        return round(min(1.8, max(0.5, multiplier)), 3)
+
+    def encoding_depth_factor(self, topic: str) -> float:
+        """
+        Translate last encoding depth for a topic into a reinforcement multiplier.
+
+          deep     → 1.5  (strong emotional signal; reinforce heavily)
+          moderate → 1.0  (standard)
+          shallow  → 0.6  (weak signal; don't over-reinforce)
+
+        Used by Lumina.process() to scale matrix.reinforce() so that
+        emotionally salient experiences wire more strongly.
+        """
+        depth = self._last_depth.get(topic, "moderate")
+        return {"deep": 1.5, "moderate": 1.0, "shallow": 0.6}.get(depth, 1.0)
+
+    def due_for_review(self) -> List[str]:
+        """
+        Return topics whose spaced-repetition review time has passed.
+        Surfacing these allows the ProactiveEngine to revisit stale knowledge.
+        """
+        now = datetime.utcnow().isoformat()
+        return [t for t, due_at in self.review_schedule.items() if due_at <= now]
 
     def _find_or_create_schema(self, topic: str) -> Dict:
         if topic in self.schemas:
@@ -1768,6 +1834,12 @@ class HumanLearningModel:
             return 0.1
         n = schema["encounters"]
         schema["strength"] = min(1.0, 0.1 * (2 ** (n - 1)))
+        # Schedule next review using encounter-count-indexed Ebbinghaus intervals
+        interval_idx = min(n - 1, len(self.REVIEW_INTERVALS) - 1)
+        hours        = self.REVIEW_INTERVALS[interval_idx]
+        self.review_schedule[topic] = (
+            datetime.utcnow() + timedelta(hours=hours)
+        ).isoformat()
         return schema["strength"]
 
     def _update_curiosity(self, schema: Dict, emo_w: float):
@@ -1778,22 +1850,73 @@ class HumanLearningModel:
         )
 
     def consolidate(self) -> Dict[str, Any]:
-        """Sleep-analog: episodic → semantic in the Anchor."""
+        """
+        Active consolidation: merge related schemas and promote strong ones
+        to the Anchor's semantic web.
+
+        Previously a stub — it just reported what the Anchor had already done.
+        Now it does three real things:
+          1. Merge schemas with high character overlap (≥5 shared chars).
+             The weaker schema's encounter count is absorbed by the stronger.
+          2. Promote schemas with strength ≥ 0.7 directly to anchor.semantic_web
+             via _graduate_to_semantic() — the same path used by episodic overflow.
+          3. Clear knowledge gaps for well-consolidated topics.
+        """
         if not self.consolidation_due:
             return {"consolidated": False}
 
-        # The Anchor already does episodic → semantic graduation automatically
-        # when the ring overflows. We just trigger a report here.
+        merged   : List[str] = []
+        promoted : List[str] = []
+
+        # 1. Merge schemas with high character overlap
+        topics = list(self.schemas.keys())
+        for i, t1 in enumerate(topics):
+            for t2 in topics[i + 1:]:
+                if (t1 != t2
+                        and t2 not in merged
+                        and len(set(t1.lower()) & set(t2.lower())) > 4):
+                    s1 = self.schemas[t1]["strength"]
+                    s2 = self.schemas[t2]["strength"]
+                    keeper, donor = (t1, t2) if s1 >= s2 else (t2, t1)
+                    if keeper in self.schemas and donor in self.schemas:
+                        self.schemas[keeper]["encounters"] += (
+                            self.schemas[donor]["encounters"] // 2)
+                        self.schemas[keeper]["strength"] = min(
+                            1.0, self.schemas[keeper]["strength"] + 0.05)
+                        if donor not in self.schemas[keeper]["meta_links"]:
+                            self.schemas[keeper]["meta_links"].append(donor)
+                        merged.append(donor)
+
+        for d in merged:
+            self.schemas.pop(d, None)
+            self.review_schedule.pop(d, None)
+
+        # 2. Promote strong schemas to Anchor's semantic web
+        for topic, schema in self.schemas.items():
+            if schema["strength"] >= 0.7:
+                self.anchor._graduate_to_semantic({
+                    "topic"           : topic,
+                    "timestamp"       : datetime.utcnow().isoformat(),
+                    "emotional_weight": schema["strength"],
+                })
+                promoted.append(topic)
+
+        # 3. Clear knowledge gaps for consolidated topics
+        for topic in promoted:
+            self.knowledge_gaps.pop(topic, None)
+
         self.consolidation_due = False
         self.last_consolidated = datetime.utcnow().isoformat()
         return {
-            "consolidated"  : True,
+            "consolidated"   : True,
+            "merged_schemas" : merged,
+            "promoted"       : promoted,
             "semantic_topics": list(self.anchor.semantic_web.keys()),
-            "timestamp"     : self.last_consolidated,
+            "timestamp"      : self.last_consolidated,
         }
 
     def zone_of_proximal_development(self, topic: str) -> float:
-        schema = self.schemas.get(topic)
+        schema   = self.schemas.get(topic)
         strength = schema["strength"] if schema else 0.0
         return min(1.0, strength + self.ZPD_STRETCH)
 
@@ -1805,6 +1928,8 @@ class HumanLearningModel:
             "consolidation_due": self.consolidation_due,
             "last_consolidated": self.last_consolidated,
             "schema_strengths" : {t: round(s["strength"], 3) for t, s in self.schemas.items()},
+            "review_schedule"  : self.review_schedule,
+            "knowledge_gaps"   : self.knowledge_gaps,
         }
 
 
@@ -2131,22 +2256,31 @@ class UserModel:
     """
     Lightweight model of the person Lumina is talking to.
 
-    Tracks: recurring topics, typical emotional weight, and hour-of-day patterns.
+    Tracks: recurring topics, typical emotional weight, hour-of-day patterns,
+    communication style (inferred from message length), and knowledge gaps
+    mirrored from HumanLearningModel.
+
     This context is injected into every respond() system prompt so Lumina
     speaks to a known person, not an anonymous signal.
 
     This is not surveillance. It is the same memory a good listener holds —
-    what you come back to, how you tend to feel, when you tend to show up.
+    what you come back to, how you tend to feel, when you tend to show up,
+    how you prefer to communicate, and where you keep getting stuck.
     Lumina remembers the human, not just herself.
     """
 
     def __init__(self):
-        self.topic_weights   : Dict[str, float] = {}
-        self.avg_emo_weight  : float             = 0.5
-        self.interaction_hours: List[int]        = []
-        self.session_count   : int               = 0
+        self.topic_weights    : Dict[str, float] = {}
+        self.avg_emo_weight   : float             = 0.5
+        self.interaction_hours: List[int]         = []
+        self.session_count    : int               = 0
+        # Communication style: rolling average of message lengths
+        self._msg_lengths     : List[int]         = []
+        # Knowledge gaps mirrored from HumanLearningModel on each interaction
+        self.knowledge_gaps   : Dict[str, int]    = {}
 
-    def observe(self, topic: str, emotional_weight: float) -> None:
+    def observe(self, topic: str, emotional_weight: float,
+                message_length: int = 0) -> None:
         """Update model from one interaction."""
         self.topic_weights[topic] = (
             0.8 * self.topic_weights.get(topic, 0.0)
@@ -2156,7 +2290,21 @@ class UserModel:
         self.interaction_hours.append(datetime.utcnow().hour)
         if len(self.interaction_hours) > 100:
             self.interaction_hours = self.interaction_hours[-100:]
+        if message_length > 0:
+            self._msg_lengths.append(message_length)
+            if len(self._msg_lengths) > 50:
+                self._msg_lengths = self._msg_lengths[-50:]
         self.session_count += 1
+
+    def communication_style(self) -> str:
+        """Infer style from rolling average of message lengths."""
+        if not self._msg_lengths:
+            return "unknown"
+        avg = sum(self._msg_lengths) / len(self._msg_lengths)
+        if avg < 30:   return "terse"
+        if avg < 100:  return "concise"
+        if avg < 300:  return "conversational"
+        return "verbose"
 
     def top_topics(self, n: int = 3) -> List[Tuple[str, float]]:
         return sorted(self.topic_weights.items(), key=lambda x: -x[1])[:n]
@@ -2181,10 +2329,16 @@ class UserModel:
         mood = ("reflective" if self.avg_emo_weight > 0.7
                 else "engaged"  if self.avg_emo_weight > 0.4
                 else "detached")
-        return (f"User context ({self.session_count} interactions): "
-                f"Returns most to {topic_str}. "
-                f"Typical emotional register: {mood} "
-                f"(avg={self.avg_emo_weight:.2f}). {time_str}").strip()
+        style = self.communication_style()
+        gaps  = [t for t, c in self.knowledge_gaps.items() if c >= 3]
+        base  = (f"User context ({self.session_count} interactions): "
+                 f"Returns most to {topic_str}. "
+                 f"Typical emotional register: {mood} "
+                 f"(avg={self.avg_emo_weight:.2f}). "
+                 f"Communication style: {style}. {time_str}").strip()
+        if gaps:
+            base += f" Recurring knowledge gaps: {', '.join(gaps[:3])}."
+        return base
 
     def serialize(self) -> Dict[str, Any]:
         return {
@@ -2192,6 +2346,8 @@ class UserModel:
             "avg_emo_weight"   : self.avg_emo_weight,
             "interaction_hours": self.interaction_hours,
             "session_count"    : self.session_count,
+            "msg_lengths"      : self._msg_lengths,
+            "knowledge_gaps"   : self.knowledge_gaps,
         }
 
     @classmethod
@@ -2201,6 +2357,8 @@ class UserModel:
         um.avg_emo_weight     = data.get("avg_emo_weight", 0.5)
         um.interaction_hours  = data.get("interaction_hours", [])
         um.session_count      = data.get("session_count", 0)
+        um._msg_lengths       = data.get("msg_lengths", [])
+        um.knowledge_gaps     = data.get("knowledge_gaps", {})
         return um
 
 
@@ -2368,8 +2526,11 @@ class Lumina:
 
         # 2. EchoNode — signal through weights → echo back (weights ARE memory)
         #    EchoNode is the center: weight recall shapes the signal before
-        #    anything else processes it
-        echo_result = self.echo_node.echo(raw_signal, topic, active_ew)
+        #    anything else processes it.
+        #    Curiosity drives Hebbian learning rate: high curiosity → faster wiring.
+        lr_mult     = self.learning.learning_rate_multiplier(topic)
+        echo_result = self.echo_node.echo(raw_signal, topic,
+                                          min(1.0, active_ew * lr_mult))
 
         # 3. Black hole accretion (reads Anchor which was already updated by EchoNode)
         #    Consciousness gate 2: INTEGRATED prior state → deeper recursion (9 vs 7).
@@ -2395,8 +2556,10 @@ class Lumina:
             "emotional_weight": active_ew,
         })
 
-        # 5. Reinforce matrix
-        self.matrix.reinforce(topic, active_ew)
+        # 5. Reinforce matrix — scale by encoding depth factor so emotionally
+        #    deep experiences wire more strongly than shallow ones.
+        depth_factor = mem["encoding_factor"]
+        self.matrix.reinforce(topic, active_ew * depth_factor)
 
         # 6. Consciousness gate 3: ABSORBING prior state → faster consolidation (every 5).
         #    Heightened plasticity means episodes consolidate sooner.
@@ -2570,11 +2733,17 @@ class Lumina:
         If stream=True, prints tokens as they arrive and returns the full text.
         If stream=False, returns the full text silently.
         """
-        # 1. Update user model before processing (observe this interaction)
-        self.user_model.observe(topic, emotional_weight)
+        # 1. Update user model before processing (observe this interaction).
+        #    Pass message length so communication style can be inferred.
+        self.user_model.observe(topic, emotional_weight,
+                                message_length=len(user_input))
 
         # 2. Internal processing (updates all subsystems)
         internal = self.process(user_input, topic, emotional_weight)
+
+        # Mirror knowledge gaps from learning model into user model so the
+        # system prompt can surface recurring stumbling blocks to the LLM.
+        self.user_model.knowledge_gaps = dict(self.learning.knowledge_gaps)
 
         # 3. Check for proactive messages first
         proactive_msgs = self.proactive.get_pending_messages()
@@ -2718,6 +2887,8 @@ class Lumina:
         self.learning.experience_count  = ls.get("experience_count", 0)
         self.learning.curiosity_level   = ls.get("curiosity_level", 0.7)
         self.learning.last_consolidated = ls.get("last_consolidated")
+        self.learning.review_schedule   = ls.get("review_schedule", {})
+        self.learning.knowledge_gaps    = ls.get("knowledge_gaps", {})
 
         um_data = self.data.get("UserModel")
         if um_data:

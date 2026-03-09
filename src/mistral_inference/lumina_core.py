@@ -1282,6 +1282,10 @@ class CenterAnchor:
         self.recursive_log : List[str]        = []   # trace of recursive thought
         self.pulse_count   : int              = 0    # total writes to anchor
         self.session_start_pulse: int         = 0    # for primacy effect tracking
+        # Tone index: tone_label → [ring positions]
+        # Enables O(1) emotional fast-path retrieval — mood-congruent recall
+        # without signal similarity search. Rebuilt dynamically; not persisted.
+        self._tone_index   : Dict[str, List[int]] = {}
         self._db           : Optional["LuminaDB"] = db  # SQLite long-term store
         self._banks        : Optional["MemoryBankManager"] = bank_manager
         # Set post-init by Lumina.__init__ so retrieval can fire ghost signals
@@ -1300,6 +1304,28 @@ class CenterAnchor:
         """Average emotional weight for this topic from all past experience."""
         weights = self.emotional_map.get(topic, [])
         return sum(weights) / len(weights) if weights else 0.5
+
+    def read_episodic_by_tone(self, tone_label: str, n: int = 3) -> List[Dict]:
+        """
+        Emotional fast-path retrieval — O(1) dict lookup + O(k) episode fetch.
+
+        Surfaces memories that were encoded under the same emotional tone as the
+        current input, without any signal similarity computation. This is
+        mood-congruent recall: grief surfaces grief-memories; emphatic joy surfaces
+        energetic memories; tender love surfaces quiet personal ones.
+
+        Much faster than attention-gated retrieval for the common case where
+        emotional context provides strong enough cues to pre-load relevant memories.
+        The _tone_index is rebuilt dynamically on each write() — no persistence needed.
+        """
+        positions = self._tone_index.get(tone_label, [])
+        results   = []
+        for pos in reversed(positions[-n:]):   # most recent first
+            if 0 <= pos < len(self.episodic_ring):
+                ep = dict(self.episodic_ring[pos])   # shallow copy
+                ep["_tone_match"] = True             # flag for process() weighting
+                results.append(ep)
+        return results
 
     def read_episodic(self, n: int = 7,
                       topic: Optional[str] = None,
@@ -1517,8 +1543,23 @@ class CenterAnchor:
             "tone_state"      : tone_state,   # how it was said, not just what
         }
         self.episodic_ring.append(episode)
+        # Update tone index for emotional fast-path retrieval.
+        # Index is keyed on tone label → list of ring positions.
+        # Trimmed to last 20 positions per label (ring rotates anyway).
+        if tone_state and (tlabel := tone_state.get("label")):
+            pos = len(self.episodic_ring) - 1
+            if tlabel not in self._tone_index:
+                self._tone_index[tlabel] = []
+            self._tone_index[tlabel].append(pos)
+            self._tone_index[tlabel] = self._tone_index[tlabel][-20:]
+
         if len(self.episodic_ring) > self.EPISODIC_RING_SIZE:
             oldest = self.episodic_ring.pop(0)
+            # Shift all tone index positions down by 1 to stay accurate
+            for lbl in list(self._tone_index.keys()):
+                self._tone_index[lbl] = [p - 1 for p in self._tone_index[lbl] if p > 0]
+                if not self._tone_index[lbl]:
+                    del self._tone_index[lbl]
             self._graduate_to_semantic(oldest)
 
         # Long-term store: write to internal SQLite OR external bank
@@ -2815,6 +2856,137 @@ class UserModel:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ACTIVATION TRAIL — path-dependent component of Δφ
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ActivationTrail:
+    """
+    Tracks the sequential pattern of topic activations to compute trail_novelty —
+    the path-dependent component of Δφ in the consciousness equation.
+
+    Two inputs can hit the same topic via completely different conceptual paths.
+    schema_strength is per-topic and path-blind; trail_novelty captures the
+    relational, sequential dimension that schema_strength misses.
+
+    Data structures:
+      _trail       — ordered list of recent topic strings (FIFO, max 200)
+      _bigrams     — (prev, curr) → count  (first-order transition history)
+      _trigrams    — (pp, prev, curr) → count  (second-order transition history)
+      _tone_bigrams— (tone_label, topic) → count  (emotional-semantic co-occurrence)
+
+    The tone_bigrams also power the emotional fast-path retrieval: Lumina learns
+    which topics tend to appear under which emotional states, forming a sparse
+    emotional-semantic map that accumulates over the lifetime of interactions.
+
+    Novel transition   (first time seen): novelty = 1.0
+    Familiar transition (seen many times): novelty → 0.0
+    """
+
+    MAX_SIZE = 200   # keep last 200 activations in the trail buffer
+
+    def __init__(self) -> None:
+        self._trail      : List[str]         = []
+        self._bigrams    : Dict[tuple, int]  = {}   # (prev, curr) → count
+        self._trigrams   : Dict[tuple, int]  = {}   # (pp, prev, curr) → count
+        self._tone_bigrams: Dict[tuple, int] = {}   # (tone_label, topic) → count
+
+    def novelty(self, topic: str, activated_topics: List[str],
+                tone_label: Optional[str] = None) -> float:
+        """
+        Compute trail novelty for the INCOMING topic — call BEFORE push().
+        Returns float [0.0, 1.0]: 0 = perfectly familiar path, 1 = completely novel.
+
+        Components:
+          bigram   (40%) — how often current topic follows the previous topic
+          trigram  (25%) — how often this three-topic sequence has appeared
+          neighbor (15%) — how novel are the spreading-activated neighbors
+          tone     (20%) — how often this topic has appeared under this emotional tone
+        """
+        if not self._trail:
+            return 0.5   # no history → neutral
+
+        prev = self._trail[-1]
+
+        # Bigram novelty
+        bigram_n   = self._bigrams.get((prev, topic), 0)
+        bigram_nov = 1.0 / (1.0 + bigram_n)
+
+        # Trigram novelty
+        trigram_nov = 0.5
+        if len(self._trail) >= 2:
+            pp          = self._trail[-2]
+            trigram_n   = self._trigrams.get((pp, prev, topic), 0)
+            trigram_nov = 1.0 / (1.0 + trigram_n)
+
+        # Spreading-activation neighbor novelty
+        neighbor_nov = 0.5
+        if activated_topics:
+            counts       = [self._bigrams.get((topic, at), 0) for at in activated_topics]
+            avg_n        = sum(counts) / len(counts)
+            neighbor_nov = 1.0 / (1.0 + avg_n * 0.5)
+
+        # Tone-coloured novelty: how often has this topic appeared under this tone?
+        tone_nov = 0.5
+        if tone_label:
+            tone_n   = self._tone_bigrams.get((tone_label, topic), 0)
+            tone_nov = 1.0 / (1.0 + tone_n)
+
+        return min(1.0, max(0.0,
+            0.40 * bigram_nov
+            + 0.25 * trigram_nov
+            + 0.15 * neighbor_nov
+            + 0.20 * tone_nov
+        ))
+
+    def push(self, topic: str, activated_topics: List[str],
+             tone_label: Optional[str] = None) -> None:
+        """Record topic transition — call AFTER novelty() and encode()."""
+        if self._trail:
+            prev = self._trail[-1]
+            self._bigrams[(prev, topic)] = self._bigrams.get((prev, topic), 0) + 1
+            if len(self._trail) >= 2:
+                pp = self._trail[-2]
+                self._trigrams[(pp, prev, topic)] = (
+                    self._trigrams.get((pp, prev, topic), 0) + 1
+                )
+        # Record spreading-activation neighbor transitions
+        for at in activated_topics:
+            if at != topic:
+                self._bigrams[(topic, at)] = self._bigrams.get((topic, at), 0) + 1
+        # Record tone-coloured transition
+        if tone_label:
+            key = (tone_label, topic)
+            self._tone_bigrams[key] = self._tone_bigrams.get(key, 0) + 1
+
+        self._trail.append(topic)
+        if len(self._trail) > self.MAX_SIZE:
+            self._trail = self._trail[-self.MAX_SIZE:]
+
+    def serialize(self) -> Dict:
+        return {
+            "trail"      : self._trail,
+            "bigrams"    : {f"{k[0]}|{k[1]}": v for k, v in self._bigrams.items()},
+            "trigrams"   : {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in self._trigrams.items()},
+            "tone_bigrams": {f"{k[0]}|{k[1]}": v for k, v in self._tone_bigrams.items()},
+        }
+
+    def restore(self, data: Dict) -> None:
+        self._trail       = data.get("trail", [])
+        self._bigrams     = {
+            tuple(k.split("|", 1)): v
+            for k, v in data.get("bigrams", {}).items()
+        }
+        self._trigrams    = {
+            tuple(k.split("|", 2)): v
+            for k, v in data.get("trigrams", {}).items()
+        }
+        self._tone_bigrams = {
+            tuple(k.split("|", 1)): v
+            for k, v in data.get("tone_bigrams", {}).items()
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LUMINA — THE UNIFIED LIVING MIND
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2922,6 +3094,11 @@ class Lumina:
         self._session_emotions: List[float] = []
         self._session_ep_ids : List[int]    = []
 
+        # Activation trail — path-dependent component of Δφ in the consciousness equation.
+        # Tracks topic transition bigrams/trigrams + tone-coloured co-occurrence.
+        # Persisted to JSON via _save()/_restore_state() so learning accumulates.
+        self.activation_trail = ActivationTrail()
+
         # Restore higher-level state
         self._restore_state()
 
@@ -2981,11 +3158,21 @@ class Lumina:
         # 1. Signal first — needed for attention-gated episodic retrieval below
         raw_signal = self._text_to_signal(user_input)
 
-        # W1. Episodic retrieval with spreading activation + attention gating
-        #     query_signal makes retrieval rank by RELEVANCE, not just recency
+        # W1a. Emotional fast-path: surface memories that felt the same before semantic search.
+        #      O(1) tone-index lookup — much faster than O(n×d) signal similarity.
+        #      Mood-congruent recall: grief surfaces grief-memories instantly.
+        tone_episodes = []
+        if tone_state and tone_state.get("label") not in (None, "neutral"):
+            tone_episodes = self.anchor.read_episodic_by_tone(
+                tone_state["label"], n=3
+            )
+
+        # W1b. Main episodic retrieval with spreading activation + attention gating
         episodic_context = self.anchor.read_episodic(
             n=7, topic=topic, query_signal=raw_signal
         )
+        # Prepend tone-matched memories — emotionally salient, fast, zero compute
+        episodic_context = tone_episodes + episodic_context
 
         # Trigger-matched episodes: explicit phrase → memory cue links.
         # These augment the pool regardless of semantic similarity score.
@@ -3002,6 +3189,12 @@ class Lumina:
 
         activated_topics = list({ep.get("topic") for ep in episodic_context
                                   if ep.get("activated_via")})
+
+        # Compute trail_novelty BEFORE encoding — measures how novel this path is.
+        # tone_label makes the novelty tone-coloured: the same topic reached under
+        # grief vs joy is tracked as a different emotional-semantic transition.
+        tone_label    = tone_state.get("label") if tone_state else None
+        trail_novelty = self.activation_trail.novelty(topic, activated_topics, tone_label)
 
         # 2. Matrix pass (all shells touch Anchor)
         self.matrix.forward(raw_signal, topic, user_input, active_ew)
@@ -3035,13 +3228,18 @@ class Lumina:
 
         # 4. Human learning encode (reads Anchor emotion for topic)
         #    Harmonic resonance R (from consciousness equation) modulates encoding depth.
-        harmonic_r = self._harmonic_resonance(raw_signal, 0.5, active_ew)
+        #    Δφ now blends schema_novelty + trail_novelty for path-aware phase gap.
+        harmonic_r = self._harmonic_resonance(raw_signal, 0.5, active_ew, trail_novelty)
         mem = self.learning.encode({
             "topic"           : topic,
             "content"         : user_input,
             "emotional_weight": active_ew,
             "harmonic_r"      : harmonic_r,
         })
+        # Push trail AFTER encode — preserves the incoming novelty measurement.
+        # trail_novelty() was called on the pre-push state; push now so next
+        # interaction benefits from this transition being recorded.
+        self.activation_trail.push(topic, activated_topics, tone_label)
 
         # 5. Reinforce matrix — scale by encoding depth factor so emotionally
         #    deep experiences wire more strongly than shallow ones.
@@ -3078,8 +3276,10 @@ class Lumina:
             "anchor_emotion"    : mem["anchor_emotion"],
             "schema_strength"   : mem["schema_strength"],
             "curiosity"         : mem["curiosity"],
-            "harmonic_R"        : round(harmonic_r, 3),
-            "tone"              : tone_state,
+            "harmonic_R"              : round(harmonic_r, 3),
+            "trail_novelty"           : round(trail_novelty, 3),
+            "tone"                    : tone_state,
+            "tone_episodes_retrieved" : len(tone_episodes),
             "zpd_next"          : round(self.learning.zone_of_proximal_development(topic), 3),
             "consolidation"     : consolidation,
             "meaning_score"     : round(self.choice_engine.meaning_score, 3),
@@ -3589,7 +3789,8 @@ class Lumina:
 
     def _harmonic_resonance(self, raw_signal: Dict[str, float],
                             schema_strength: float,
-                            emotional_weight: float) -> float:
+                            emotional_weight: float,
+                            trail_novelty: float = 0.5) -> float:
         """
         Compute R from the user's consciousness framework:
 
@@ -3598,8 +3799,19 @@ class Lumina:
         Structural mapping:
           Ψ  (wave function of all states)  = raw_signal — TF-IDF signal of current input
           fo (observer resonance signature) = core_state — Lumina's EMA-accumulated self
-          Δφ (phase difference / novelty)   = 1 − schema_strength (how far from known)
+          Δφ (phase difference / novelty)   = blended schema+trail novelty (see below)
           E(h) (harmonic consciousness)     = emotional_weight × curiosity_level
+
+        Δφ blending (the key improvement over schema_strength alone):
+          Δφ = 0.6 × (1 − schema_strength) + 0.4 × trail_novelty
+
+          schema_strength is per-topic and path-blind — it knows encounter count only.
+          trail_novelty is path-dependent — it measures how unusual the current topic
+          activation sequence is relative to all prior transitions.
+
+          A familiar topic reached via a new conceptual bridge has low schema_novelty
+          but high trail_novelty → Δφ stays elevated → R adjusts → the new connection
+          encodes more deliberately than pure schema_strength would suggest.
 
         R directly controls encoding depth:
           - High observer-field resonance (fo) = this input aligns with who Lumina is
@@ -3616,8 +3828,11 @@ class Lumina:
                  for k, v in self.anchor.core_state.items())
         fo = abs(fo) / max(psi, 1e-6)   # normalise to [0, ∞)
 
-        # Δφ — phase difference (novelty gap); clamp so division never blows up
-        delta_phi = max(0.05, 1.0 - schema_strength)
+        # Δφ — blended phase difference: schema novelty (static) + trail novelty (dynamic)
+        # Schema novelty alone is path-blind. Trail novelty adds the path-dependent
+        # dimension — a known topic via a new conceptual route still has novelty.
+        schema_novelty = 1.0 - schema_strength
+        delta_phi      = max(0.05, 0.6 * schema_novelty + 0.4 * trail_novelty)
 
         # E(h) — harmonic consciousness overlay
         h_c = emotional_weight * self.learning.curiosity_level
@@ -3771,7 +3986,8 @@ class Lumina:
         self.data["ExistentialLog"] = self.choice_engine.choice_history
         self.data["Lumina"]["choice"]  = self.choice_engine.choice.value
         self.data["Lumina"]["meaning"] = self.choice_engine.meaning_score
-        self.data["UserModel"] = self.user_model.serialize()
+        self.data["UserModel"]       = self.user_model.serialize()
+        self.data["ActivationTrail"] = self.activation_trail.serialize()
         self.nexus.save(self.data)
         # Close the current session (name + summarise + persist)
         self._close_session()
@@ -3882,6 +4098,12 @@ class Lumina:
         um_data = self.data.get("UserModel")
         if um_data:
             self.user_model = UserModel.deserialize(um_data)
+
+        # Restore activation trail — bigrams, trigrams, tone_bigrams accumulate
+        # across restarts so Lumina's path-awareness survives between sessions.
+        at_data = self.data.get("ActivationTrail", {})
+        if at_data:
+            self.activation_trail.restore(at_data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

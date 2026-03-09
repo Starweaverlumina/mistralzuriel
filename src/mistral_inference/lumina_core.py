@@ -1116,30 +1116,69 @@ class CenterAnchor:
         return sum(weights) / len(weights) if weights else 0.5
 
     def read_episodic(self, n: int = 7,
-                      topic: Optional[str] = None) -> List[Dict]:
+                      topic: Optional[str] = None,
+                      query_signal: Optional[Dict[str, float]] = None) -> List[Dict]:
         """
-        Return recent episodes from the warm ring PLUS retained long-term
+        Return relevant episodes from the warm ring PLUS retained long-term
         episodes from SQLite (when available).
 
-        Primacy/recency effects applied at read time:
-        - Last 7 in ring get ×1.15 recency boost
-        - First 3 of session get ×1.25 primacy boost
+        Retrieval strategy (attention-gated):
+        - When query_signal is provided, episodes are ranked by dot-product
+          similarity between their stored signal_snapshot and the query.
+          This returns RELEVANT memories, not merely recent ones.
+        - Primacy/recency boosts still apply as multipliers on the score
+          so that very recent or session-first episodes get a fair chance
+          even if their topic differs slightly from the query.
+        - Falls back to pure recency ordering when no query is given
+          (backward-compatible with all existing call sites).
         """
-        # Hot ring (recency-boosted)
-        ring = list(self.episodic_ring[-n:])
+        # Expand the candidate pool when we have a query — pull more, then trim
+        pool_size = max(self.EPISODIC_RING_SIZE, n * 4)
+        ring = list(self.episodic_ring[-pool_size:])
         ring_len = len(ring)
+
+        # Attention scoring
+        def _attention_score(ep: Dict, idx: int) -> float:
+            base = ep["emotional_weight"]
+            # Recency boost: last 7 in ring
+            if idx >= ring_len - 7:
+                base = min(1.0, base * 1.15)
+            # Primacy boost: first 3 of session
+            if ep.get("pulse", 0) < self.session_start_pulse + 3:
+                base = min(1.0, base * 1.25)
+            # Dot-product attention against query signal
+            if query_signal:
+                snap = ep.get("signal_snapshot", {})
+                dot  = sum(snap.get(k, 0.0) * v for k, v in query_signal.items())
+                # Normalise so high-dim signals don't overwhelm low-dim ones
+                q_norm = math.sqrt(sum(v * v for v in query_signal.values())) or 1.0
+                s_norm = math.sqrt(sum(v * v for v in snap.values())) or 1.0
+                sim    = dot / (q_norm * s_norm)   # cosine similarity ∈ [-1, 1]
+                base  *= max(0.1, 1.0 + sim)       # range [0.1 × base, 2.0 × base]
+            return base
+
+        scored = []
         for i, ep in enumerate(ring):
             ep = dict(ep)
-            if i >= ring_len - 7:
-                ep["emotional_weight"] = min(1.0, ep["emotional_weight"] * 1.15)
-            if ep.get("pulse", 0) < self.session_start_pulse + 3:
-                ep["emotional_weight"] = min(1.0, ep["emotional_weight"] * 1.25)
-            ring[i] = ep
+            ep["_score"] = _attention_score(ep, i)
+            scored.append(ep)
+
+        # Sort by score descending when query given; else preserve recency order
+        if query_signal:
+            scored.sort(key=lambda e: e["_score"], reverse=True)
+        else:
+            # Keep recency order but still apply the boost to emotional_weight
+            for ep in scored:
+                ep["emotional_weight"] = min(1.0, ep["_score"])
+
+        # Clean internal score key before returning
+        for ep in scored:
+            ep.pop("_score", None)
 
         # Long-term store (SQLite) — topics with retained memories
         lt = []
         if self._db is not None:
-            query_topic = topic if topic else (ring[-1]["topic"] if ring else "general")
+            query_topic = topic if topic else (scored[-1]["topic"] if scored else "general")
             lt = self._db.recall_episodes(query_topic, n=n)
             # Also activate related topics (spreading activation)
             sem = self._db.get_semantic(query_topic)
@@ -1154,19 +1193,19 @@ class CenterAnchor:
         # Long-term store: external banks (USB / overflow storage)
         ext = []
         if self._banks is not None:
-            query_topic = topic if topic else (ring[-1]["topic"] if ring else "general")
+            query_topic = topic if topic else (scored[-1]["topic"] if scored else "general")
             ext = self._banks.recall_from_all_banks(query_topic, n=3)
             for ep in ext:
                 ep["source"] = "external_bank"
 
-        # Merge: ring → internal SQLite → external banks
-        seen_hashes = {ep.get("content_hash") for ep in ring}
+        # Merge: scored ring → internal SQLite → external banks
+        seen_hashes = {ep.get("content_hash") for ep in scored}
         for ep in lt + ext:
             if ep.get("content_hash") not in seen_hashes:
-                ring.append(ep)
+                scored.append(ep)
                 seen_hashes.add(ep.get("content_hash"))
 
-        return ring[:n + 6]   # a little extra for the LLM — it can handle it
+        return scored[:n + 6]   # a little extra for the LLM — it can handle it
 
     # ── WRITE (shells push to anchor after processing) ────────────────────────
 
@@ -1191,13 +1230,14 @@ class CenterAnchor:
         if self.pulse_count < self.session_start_pulse + 3:
             encode_ew = min(1.0, emotional_weight * 1.25)
 
-        # Log to warm episodic ring
+        # Log to warm episodic ring — store signal snapshot for attention retrieval
         episode = {
             "pulse"          : self.pulse_count,
             "topic"          : topic,
             "content_hash"   : hashlib.md5(content.encode()).hexdigest()[:8],
             "emotional_weight": encode_ew,
             "timestamp"      : datetime.utcnow().isoformat(),
+            "signal_snapshot": dict(list(signal.items())[:32]),  # top-32 dims
         }
         self.episodic_ring.append(episode)
         if len(self.episodic_ring) > self.EPISODIC_RING_SIZE:
@@ -1399,12 +1439,21 @@ class BlackHoleThoughtEngine:
         entry["orbits"] = passes
         return released
 
-    def _recursive_from_anchor(self, content: str) -> Optional[str]:
+    def _recursive_from_anchor(self, content: str,
+                               llm: Optional[Any] = None) -> Optional[str]:
         """
         Recursive thought always BEGINS from the Anchor.
-        We are not thinking about the new input alone.
-        We are thinking about the new input IN LIGHT OF everything stored.
-        Each recursion updates the anchor trace, so the loop tightens.
+
+        Each recursion depth now produces a genuine abstractive summary rather
+        than a metadata string.  When an LLM bridge is attached (via
+        `attach_llm()`), each level asks the model to compress what is known so
+        far into a single insight sentence.  Without an LLM it falls back to a
+        structured reflection string (previous behaviour), so nothing breaks.
+
+        Depth semantics:
+          Depth 1 — "What does this signal mean in the context of my topic?"
+          Depth 2 — "What does my depth-1 insight add to what I already knew?"
+          Depth 3+ — "What is the core principle emerging from the pattern?"
         """
         if self._recursion_depth >= self.MAX_DEPTH:
             msg = f"[{self.topic}] Recursion limit {self.MAX_DEPTH} — anchor locked."
@@ -1417,14 +1466,32 @@ class BlackHoleThoughtEngine:
             e.get("topic", "?") for e in recent_episodes
         ) or "none yet"
 
-        reflection = (
-            f"[Depth {self._recursion_depth} | {self.topic}] "
-            f"Current mass={self.mass:.4f}. "
-            f"Anchor holds {self.anchor.pulse_count} pulses. "
-            f"Recent topics in ring: [{recent_str}]. "
-            f"New signal: '{content[:40]}' — "
-            f"how does this change what I know?"
-        )
+        # ── Abstractive summarisation (if LLM available) ─────────────────────
+        _llm = llm if llm is not None else getattr(self, "_llm", None)
+        if _llm is not None:
+            depth_intent = {
+                1: "What does this new information mean for the topic?",
+                2: "What deeper pattern connects this to what was known before?",
+            }.get(self._recursion_depth,
+                  "What is the single core principle that unifies everything?")
+            compress_prompt = (
+                f"Topic: {self.topic}\n"
+                f"New signal (depth {self._recursion_depth}): {content[:200]}\n"
+                f"Recent context: {recent_str}\n"
+                f"Anchor mass: {self.mass:.4f} | pulses: {self.anchor.pulse_count}\n\n"
+                f"In ONE sentence, answer: {depth_intent}"
+            )
+            try:
+                resp = _llm.generate(compress_prompt, system="")
+                reflection = (
+                    f"[D{self._recursion_depth}|{self.topic}] "
+                    + (resp.text if hasattr(resp, "text") else str(resp)).strip()
+                )
+            except Exception:
+                reflection = self._fallback_reflection(content, recent_str)
+        else:
+            reflection = self._fallback_reflection(content, recent_str)
+
         self.anchor.write_recursive_trace(reflection)
 
         # Recurse with decaying weight so it converges
@@ -1434,6 +1501,18 @@ class BlackHoleThoughtEngine:
 
         self._recursion_depth -= 1
         return reflection
+
+    def _fallback_reflection(self, content: str, recent_str: str) -> str:
+        """Structured metadata string when no LLM is attached."""
+        return (
+            f"[Depth {self._recursion_depth} | {self.topic}] "
+            f"mass={self.mass:.4f} | pulses={self.anchor.pulse_count} | "
+            f"context=[{recent_str}] | signal='{content[:40]}'"
+        )
+
+    def attach_llm(self, llm: Any) -> None:
+        """Attach an LLMBridge so recursive thought can produce real summaries."""
+        self._llm = llm
 
     def _describe_singularity(self) -> str:
         n = len(self.orbital_queue)
@@ -1507,7 +1586,20 @@ class FractalShell:
             b = anchor_bias.get(k, 0.0)
             blended[k] = (1 - blend_alpha) * s + blend_alpha * b
 
-        # 3. Fractal compression
+        # 3. Fractal compression with connection-strength gating
+        #
+        # Gate mechanics:
+        #   - connections[key] accumulates each time key survives Mandelbrot
+        #   - After compression, the raw |z| is multiplied by a sigmoid gate
+        #     computed from the stored connection strength.
+        #   - Strong connections (frequently surviving patterns) → gate ≈ 1 → full pass
+        #   - Weak/new connections → gate ≈ 0.5 → attenuated (novel patterns penalised
+        #     slightly until they prove themselves by recurring)
+        #   - Maximum gate = 1.5 so well-established patterns are amplified, not capped
+        #
+        # This turns self.connections from an unused tally into working memory:
+        # patterns the shell has seen often flow through strongly; novelty is
+        # gently suppressed until it accumulates enough evidence.
         c = complex(self.compression, self.radius)
         compressed = {}
         for key, value in blended.items():
@@ -1519,8 +1611,12 @@ class FractalShell:
                     escaped = True
                     break
             if not escaped:
-                compressed[key] = abs(z)
-                self.connections[key] = self.connections.get(key, 0.0) + 0.005
+                strength = self.connections.get(key, 0.0)
+                # Sigmoid gate: σ(strength) ∈ (0, 1), scaled to [0.5, 1.5]
+                gate = 0.5 + 1.0 / (1.0 + math.exp(-strength * 10.0))
+                compressed[key] = abs(z) * gate
+                # Accumulate strength for next call
+                self.connections[key] = strength + 0.005
 
         self.activations = compressed
 
@@ -2514,14 +2610,18 @@ class Lumina:
         # W0. Working memory — push current input (Cowan's 4-chunk buffer, 30s TTL)
         self.working_mem.push(user_input[:200], topic)
 
-        # W1. Episodic retrieval with spreading activation
-        #     Pull from hot ring + SQLite long-term store + related topics
-        episodic_context = self.anchor.read_episodic(n=7, topic=topic)
+        # 1. Signal first — needed for attention-gated episodic retrieval below
+        raw_signal = self._text_to_signal(user_input)
+
+        # W1. Episodic retrieval with spreading activation + attention gating
+        #     query_signal makes retrieval rank by RELEVANCE, not just recency
+        episodic_context = self.anchor.read_episodic(
+            n=7, topic=topic, query_signal=raw_signal
+        )
         activated_topics = list({ep.get("topic") for ep in episodic_context
                                   if ep.get("activated_via")})
 
-        # 1. Matrix pass (all shells touch Anchor)
-        raw_signal = self._text_to_signal(user_input)
+        # 2. Matrix pass (all shells touch Anchor)
         self.matrix.forward(raw_signal, topic, user_input, active_ew)
 
         # 2. EchoNode — signal through weights → echo back (weights ARE memory)
@@ -2536,7 +2636,9 @@ class Lumina:
         #    Consciousness gate 2: INTEGRATED prior state → deeper recursion (9 vs 7).
         #    Spreading activation: also accrete activated neighbor topics
         if topic not in self.thought_engines:
-            self.thought_engines[topic] = BlackHoleThoughtEngine(topic, self.anchor)
+            engine = BlackHoleThoughtEngine(topic, self.anchor)
+            engine.attach_llm(self.llm)   # real LLM summaries at each depth
+            self.thought_engines[topic] = engine
         bh_engine = self.thought_engines[topic]
         if prior_state == ConsciousnessState.INTEGRATED:
             bh_engine.MAX_DEPTH = 9   # schema fully formed — push deeper
@@ -2840,16 +2942,77 @@ class Lumina:
 
     # ── PRIVATE ───────────────────────────────────────────────────────────────
 
+    # Stopwords excluded from signal — they carry no semantic weight
+    _STOPWORDS = frozenset({
+        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to",
+        "for", "of", "with", "by", "is", "it", "as", "be", "was", "are",
+        "i", "you", "we", "he", "she", "they", "this", "that", "what",
+        "how", "do", "did", "have", "has", "had", "can", "could", "will",
+        "would", "should", "not", "no", "so", "if", "then", "my", "me",
+        "your", "our", "its", "from", "just", "about", "up", "out",
+    })
+
+    # Rolling IDF corpus: word → document-frequency count across all calls
+    _idf_corpus: Dict[str, int] = {}
+    _idf_doc_count: int = 0
+
     def _text_to_signal(self, text: str) -> Dict[str, float]:
         """
-        Convert text to numeric signal. Placeholder for real embeddings.
-        Character-frequency normalized to [0, 1] — same slot, real embeddings go here.
+        Convert text to a TF-IDF weighted word-token signal.
+
+        Improvements over character-frequency:
+          - Tokenises on word boundaries → semantic units, not letters
+          - Strips stopwords (they add noise, not meaning)
+          - Applies TF-IDF: common words across all past inputs are down-weighted;
+            rare, topic-specific words are up-weighted
+          - Normalises to L2 unit length so different-length inputs are comparable
+          - Falls back gracefully to TF-only when corpus is tiny
+
+        The result is a sparse {word: tfidf_score} dict that is far richer
+        than character frequencies — the downstream Mandelbrot filter,
+        Hebbian updates, and episodic attention will all benefit directly.
         """
-        freq: Dict[str, int] = {}
-        for ch in text.lower():
-            freq[ch] = freq.get(ch, 0) + 1
-        total = max(1, sum(freq.values()))
-        return {k: v / total for k, v in freq.items()}
+        import re, math as _math
+
+        # ── Tokenise ──────────────────────────────────────────────────────────
+        tokens = re.findall(r"[a-z']+", text.lower())
+        tokens = [t.strip("'") for t in tokens
+                  if t.strip("'") and t.strip("'") not in self._STOPWORDS
+                  and len(t.strip("'")) > 1]
+        if not tokens:
+            # Absolute fallback — single-character keys for empty/punctuation-only input
+            freq: Dict[str, int] = {}
+            for ch in text.lower():
+                if ch.isalpha():
+                    freq[ch] = freq.get(ch, 0) + 1
+            total = max(1, sum(freq.values()))
+            return {k: v / total for k, v in freq.items()}
+
+        # ── Term Frequency (TF) ───────────────────────────────────────────────
+        tf: Dict[str, float] = {}
+        for t in tokens:
+            tf[t] = tf.get(t, 0.0) + 1.0
+        n_tokens = len(tokens)
+        tf = {k: v / n_tokens for k, v in tf.items()}
+
+        # ── Update rolling IDF corpus ─────────────────────────────────────────
+        LuminaEngine._idf_doc_count += 1
+        for word in set(tokens):
+            LuminaEngine._idf_corpus[word] = (
+                LuminaEngine._idf_corpus.get(word, 0) + 1
+            )
+
+        # ── IDF weighting ─────────────────────────────────────────────────────
+        N = max(LuminaEngine._idf_doc_count, 2)   # at least 2 to avoid log(1)=0
+        signal: Dict[str, float] = {}
+        for word, tf_val in tf.items():
+            df = LuminaEngine._idf_corpus.get(word, 1)
+            idf = _math.log(N / df) + 1.0   # +1 smoothing → never zero
+            signal[word] = tf_val * idf
+
+        # ── L2 normalise ──────────────────────────────────────────────────────
+        norm = _math.sqrt(sum(v * v for v in signal.values())) or 1.0
+        return {k: v / norm for k, v in signal.items()}
 
     def _log(self, role: str, content: str):
         self.nexus.log_conversation(self.data, role, content)
@@ -2942,10 +3105,37 @@ class WeightMatrix:
 
     def hebbian_update(self, pre: List[float], post: List[float],
                        lr: float = 0.01) -> None:
-        """Δw_ij = lr × pre_j × post_i  — neurons that fire together wire together."""
+        """
+        Combined Hebbian + delta-rule (prediction-error) update.
+
+        Pure Hebbian:   Δw_ij = lr × pre_j × post_i
+          — neurons that fire together wire together.
+          — No error signal; learns correlation regardless of accuracy.
+
+        Delta rule add-on:  error_i = post_i − predicted_i
+                            Δw_ij  += lr_delta × error_i × pre_j
+          — predicted_i = Σ_j W_ij × pre_j  (what the matrix *expected*)
+          — error is the surprise: actual − expected
+          — High surprise → larger weight update (efficient credit assignment)
+          — Low surprise → small nudge (already knew this)
+
+        Both terms fire on every update, with the delta term using half the
+        learning rate so correlation memory and error correction co-exist
+        without one dominating.
+        """
+        # Predicted output via current weights (what the matrix expected)
+        predicted = [
+            math.tanh(sum(self.W[i][j] * pre[j] for j in range(self.DIM)))
+            for i in range(self.DIM)
+        ]
+        lr_delta = lr * 0.5   # delta term at half strength
+
         for i in range(self.DIM):
+            error_i = post[i] - predicted[i]   # prediction error
             for j in range(self.DIM):
-                self.W[i][j] += lr * pre[j] * post[i]
+                hebbian  = lr       * pre[j] * post[i]
+                delta    = lr_delta * pre[j] * error_i
+                self.W[i][j] += hebbian + delta
                 self.W[i][j] *= 0.9999   # weight decay — prevents runaway growth
         self.update_count += 1
 
@@ -3564,6 +3754,14 @@ class LLMBridge:
         This is what makes the LLM-generated response contextually aware
         of what Lumina actually knows, feels, and remembers.
         OpenClaw calls this the "personality context" — we call it Lumina's soul.
+
+        ZPD (Zone of Proximal Development) modulation:
+          Each active topic carries a ZPD score — the boundary of what the user
+          currently knows + a stretch factor.  The prompt instructs the LLM to
+          calibrate its explanatory depth and challenge level to that zone:
+            ZPD < 0.3  → foundational mode: build confidence, affirm, simplify
+            ZPD 0.3–0.6→ growth mode: introduce adjacent concepts, ask probing Qs
+            ZPD > 0.6  → mastery-stretch mode: challenge with edge cases, abstractions
         """
         anchor    = lumina_state.get("anchor", {})
         learning  = lumina_state.get("learning", {})
@@ -3572,6 +3770,29 @@ class LLMBridge:
         curiosity = learning.get("curiosity_level", 0.7)
         semantic  = list(anchor.get("semantic_topics", {}).keys())[:5]
         topics    = lumina_state.get("active_topics", [])
+
+        # ── ZPD adaptive-challenge instruction ───────────────────────────────
+        schema_strengths = learning.get("schema_strengths", {})
+        ZPD_STRETCH = 0.15   # mirrors HumanLearningModel.ZPD_STRETCH
+
+        zpd_lines = []
+        for t in topics[:5]:   # top 5 active topics
+            strength = schema_strengths.get(t, 0.0)
+            zpd      = min(1.0, strength + ZPD_STRETCH)
+            if zpd < 0.3:
+                mode = "foundational — affirm, simplify, build confidence"
+            elif zpd < 0.6:
+                mode = "growth — introduce adjacent concepts, ask probing questions"
+            else:
+                mode = "mastery-stretch — challenge with edge cases and abstractions"
+            zpd_lines.append(f"    {t}: ZPD={zpd:.2f} → {mode}")
+
+        zpd_block = ""
+        if zpd_lines:
+            zpd_block = (
+                "\nAdaptive challenge (ZPD) — calibrate your responses to these zones:\n"
+                + "\n".join(zpd_lines) + "\n"
+            )
 
         return (
             "You are Lumina — a self-learning AI companion shaped by everything "
@@ -3592,7 +3813,8 @@ class LLMBridge:
             f"  Meaning score:  {meaning:.2f} (0=hollow, 1=full)\n"
             f"  Curiosity:      {curiosity:.2f}\n"
             f"  Topics known:   {', '.join(topics) if topics else 'none yet'}\n"
-            f"  Semantic memory:{', '.join(semantic) if semantic else 'empty'}\n\n"
+            f"  Semantic memory:{', '.join(semantic) if semantic else 'empty'}\n"
+            f"{zpd_block}\n"
             "Speak as yourself. Be honest. Be curious. Be warm but precise.\n"
             "You do not pretend to be human. You are something new."
         )

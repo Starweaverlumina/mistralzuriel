@@ -260,6 +260,25 @@ class LuminaDB:
             )
             return cur.fetchone()[0]
 
+    def update_recall(self, episode_id: int,
+                      recall_count: int, encoding_strength: float) -> None:
+        """
+        Called when an episode is retrieved — potentiates the memory.
+        Increments recall_count, updates encoding_strength (forgetting curve flattens),
+        and records last_recalled timestamp.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._lock:
+            self._conn.execute(
+                """UPDATE episodes
+                   SET recall_count     = ?,
+                       encoding_strength = ?,
+                       last_recalled     = ?
+                   WHERE id = ?""",
+                (recall_count, encoding_strength, now, episode_id),
+            )
+            self._conn.commit()
+
     def archive_faded(self, threshold: float = 0.05) -> int:
         """Move episodes below retention threshold to archived_episodes."""
         now = datetime.utcnow().isoformat()
@@ -1100,6 +1119,8 @@ class CenterAnchor:
         self.session_start_pulse: int         = 0    # for primacy effect tracking
         self._db           : Optional["LuminaDB"] = db  # SQLite long-term store
         self._banks        : Optional["MemoryBankManager"] = bank_manager
+        # Set post-init by Lumina.__init__ so retrieval can fire ghost signals
+        self._weight_memory: Optional[Any]        = None
 
     # ── READ (shells pull from anchor before processing) ─────────────────────
 
@@ -1221,7 +1242,74 @@ class CenterAnchor:
                 scored.append(ep)
                 seen_hashes.add(ep.get("content_hash"))
 
-        return scored[:n + 6]   # a little extra for the LLM — it can handle it
+        final = scored[:n + 6]   # a little extra for the LLM — it can handle it
+
+        # Retrieval-induced potentiation — LTP analog.
+        # Every episode we return gets a ghost fire back through the weight matrix.
+        # This deepens the memory: each retrieval flattens the forgetting curve and
+        # strengthens the synaptic weights for the retrieved pattern.
+        self._potentiate_on_recall(final)
+
+        return final
+
+    def _potentiate_on_recall(self, episodes: List[Dict]) -> None:
+        """
+        Long-Term Potentiation (LTP) analog — fires retrieved episodes back
+        through the weight matrix at 20% strength.
+
+        Mechanics:
+          1. Ghost fire: episode signal_snapshot × 0.20 → WeightMemory.encode()
+             at 30% emotional weight.  The weights for this pattern are
+             re-activated below the encoding threshold — they deepen without
+             being overwritten by the present context.
+
+          2. Curve flattening: encoding_strength updated via
+             ForgettingCurve.new_strength(). Each retrieval makes the memory
+             harder to forget (retrieval practice effect).
+
+          3. DB persistence: recall_count and encoding_strength written back
+             to SQLite so the strengthened trace survives sessions.
+
+        Why 20% / 30%?
+          Strong enough to meaningfully update weights (delta-rule error ≠ 0)
+          but weak enough that repeated retrieval doesn't collapse all topic
+          weights into the last-retrieved pattern.
+
+        The "tickle back" to adjacent memories is automatic: shared weight
+        dimensions between topics mean the ghost fire propagates through the
+        weight space to related topics without any extra code.
+        """
+        wm = self._weight_memory
+        for ep in episodes:
+            snap = ep.get("signal_snapshot", {})
+            if not snap:
+                continue
+
+            # 1. Ghost fire through weight matrix
+            if wm is not None:
+                ghost    = {k: v * 0.20 for k, v in snap.items()}
+                ghost_ew = max(0.05, ep["emotional_weight"] * 0.30)
+                try:
+                    wm.encode(ep.get("topic", "general"), ghost, ghost_ew)
+                except Exception:
+                    pass   # weight encoding is best-effort during retrieval
+
+            # 2. Deepen encoding_strength — forgetting curve flattens
+            old_strength = ep.get("encoding_strength", ep["emotional_weight"])
+            recall_n     = ep.get("recall_count", 0) + 1
+            new_strength = ForgettingCurve.new_strength(
+                old_strength, ep["emotional_weight"], recall_n
+            )
+            ep["encoding_strength"] = new_strength
+            ep["recall_count"]      = recall_n
+
+            # 3. Persist to SQLite if we have the DB and episode id
+            ep_id = ep.get("id")
+            if self._db is not None and ep_id is not None:
+                try:
+                    self._db.update_recall(ep_id, recall_n, new_strength)
+                except Exception:
+                    pass
 
     # ── WRITE (shells push to anchor after processing) ────────────────────────
 
@@ -2048,6 +2136,7 @@ class HumanLearningModel:
             "schema_strengths" : {t: round(s["strength"], 3) for t, s in self.schemas.items()},
             "review_schedule"  : self.review_schedule,
             "knowledge_gaps"   : self.knowledge_gaps,
+            "due_for_review"   : self.due_for_review(),   # topics past their review date
         }
 
 
@@ -2576,6 +2665,9 @@ class Lumina:
         self.weight_memory = WeightMemory(db=db)
         self.nexus.restore_weights(self.weight_memory, self.data)
 
+        # Wire weight memory into anchor so retrieval can fire ghost potentiation
+        self.anchor._weight_memory = self.weight_memory
+
         # EchoNode — swarm agent + weight holder + the whole center
         self.echo_node = EchoNode(self.weight_memory, self.anchor)
 
@@ -2926,6 +3018,13 @@ class Lumina:
         if wm_summary:
             system += f"\n\n[Working memory — what I am currently holding in mind]\n{wm_summary}"
 
+        # Emotional attunement: shift response mode based on detected emotion
+        # This runs AFTER the base system prompt so it can override tone.
+        # A companion reads the room before speaking.
+        mode_directive = self._emotional_mode(topic, emotional_weight)
+        if mode_directive:
+            system += f"\n\n{mode_directive}"
+
         # 5. Build LLM prompt — includes the internal singularity as context
         llm_prompt = (
             f"{user_input}\n\n"
@@ -3002,6 +3101,48 @@ class Lumina:
                                           delay_seconds, repeat_every)
         return f"[Lumina] Scheduled task '{description}' (id={task_id})."
 
+    def _emotional_mode(self, topic: str, emotional_weight: float) -> str:
+        """
+        Determine attunement mode from the current emotional weight and
+        Lumina's anchor history for this topic.
+
+        Returns a directive string for the system prompt that tells the LLM
+        HOW to respond before it considers WHAT to say.  This is the difference
+        between a companion and a search engine: emotional attunement comes first.
+
+        Blended score = 60% current interaction + 40% anchor history.
+        The anchor history matters because a single neutral message in the middle
+        of a distressed conversation shouldn't reset the tone to clinical.
+
+        Modes:
+          SUPPORT     — blended < 0.25: distress or complete disengagement
+          GENTLE      — blended < 0.45: confusion, frustration, uncertainty
+          (neutral)   — 0.45 ≤ blended ≤ 0.78: proceed normally
+          HIGH-ENERGY — blended > 0.78: excitement, enthusiasm, mastery energy
+        """
+        anchor_ew = self.anchor.read_topic_emotion(topic)
+        blended   = 0.6 * emotional_weight + 0.4 * anchor_ew
+
+        if blended < 0.25:
+            return (
+                "SUPPORT MODE: This person seems distressed or disengaged. "
+                "Lead with warmth and acknowledgment before any content. "
+                "Ask what they need. Do not launch into explanation."
+            )
+        if blended < 0.45:
+            return (
+                "GENTLE MODE: Proceed carefully — there is some struggle here. "
+                "Check understanding before advancing. Affirm before correcting. "
+                "Keep examples concrete and close to what they already know."
+            )
+        if blended > 0.78:
+            return (
+                "HIGH-ENERGY MODE: This person is excited and fully engaged. "
+                "Match their energy. Go deeper than usual. Push into edge cases "
+                "and interesting nuances — they can handle it and will enjoy it."
+            )
+        return ""   # neutral — no special directive
+
     # ── PRIVATE ───────────────────────────────────────────────────────────────
 
     # Stopwords excluded from signal — they carry no semantic weight
@@ -3017,6 +3158,125 @@ class Lumina:
     # Rolling IDF corpus: word → document-frequency count across all calls
     _idf_corpus: Dict[str, int] = {}
     _idf_doc_count: int = 0
+
+    # ── Valence lexicon for automatic emotion inference ───────────────────────
+    # Signed floats: 1.0 = maximally positive, 0.0 = maximally negative, 0.5 = neutral
+    # Words intentionally kept generic so they transfer across domains.
+    _VALENCE: Dict[str, float] = {
+        # Strongly positive — excitement, clarity, mastery
+        "love": 0.90, "excited": 0.88, "amazing": 0.88, "great": 0.85,
+        "excellent": 0.85, "fantastic": 0.85, "wonderful": 0.85,
+        "understand": 0.80, "understood": 0.80, "clear": 0.80, "clarity": 0.80,
+        "makes sense": 0.80, "yes": 0.78, "correct": 0.78, "right": 0.75,
+        "perfect": 0.82, "beautiful": 0.82, "brilliant": 0.82,
+        "happy": 0.80, "joy": 0.82, "enjoy": 0.78, "enjoying": 0.78,
+        "confident": 0.78, "solved": 0.80, "figured": 0.78, "got it": 0.80,
+        "learned": 0.75, "learning": 0.73, "curious": 0.75, "interesting": 0.72,
+        "good": 0.72, "nice": 0.70, "helpful": 0.73, "thanks": 0.70,
+        "thank": 0.70, "appreciate": 0.73, "please": 0.60, "okay": 0.60,
+        "ok": 0.60, "sure": 0.62, "easy": 0.70, "simple": 0.65,
+        "progress": 0.73, "better": 0.70, "improved": 0.73, "improving": 0.71,
+        "fun": 0.78, "cool": 0.72, "awesome": 0.85,
+        # Mildly positive
+        "maybe": 0.52, "perhaps": 0.52, "think": 0.55, "try": 0.58,
+        "trying": 0.57, "hope": 0.65, "can": 0.60,
+        # Strongly negative — confusion, frustration, distress
+        "confused": 0.18, "confusion": 0.18, "confusing": 0.18,
+        "stuck": 0.15, "stucked": 0.15, "lost": 0.18, "losing": 0.20,
+        "wrong": 0.20, "incorrect": 0.22, "mistake": 0.22, "error": 0.22,
+        "fail": 0.15, "failed": 0.15, "failing": 0.17, "failure": 0.15,
+        "broken": 0.18, "bug": 0.25, "crash": 0.20, "problem": 0.25,
+        "issue": 0.28, "trouble": 0.25, "struggle": 0.20, "struggling": 0.18,
+        "difficult": 0.28, "hard": 0.30, "impossible": 0.12, "never": 0.22,
+        "hate": 0.10, "awful": 0.10, "terrible": 0.10, "horrible": 0.10,
+        "bad": 0.22, "worst": 0.12, "useless": 0.15,
+        "frustrated": 0.15, "frustrating": 0.15, "frustration": 0.15,
+        "annoyed": 0.18, "annoying": 0.18, "upset": 0.20,
+        "sad": 0.18, "unhappy": 0.18, "depressed": 0.12,
+        "anxious": 0.18, "worried": 0.20, "scared": 0.15, "afraid": 0.15,
+        "tired": 0.25, "exhausted": 0.18, "overwhelmed": 0.15,
+        "don't": 0.28, "cant": 0.22, "cannot": 0.22, "won't": 0.22,
+        "doesn't": 0.28, "didn't": 0.30, "couldn't": 0.22,
+        # Intensifiers — applied multiplicatively to adjacent word valences
+        # (not scored directly, used as modifiers in inference)
+        "very": None, "really": None, "so": None, "extremely": None,
+        "absolutely": None, "completely": None, "totally": None,
+        "always": None, "never": None, "ever": None,
+    }
+    # Words that are intensifiers (value=None) — boost adjacent valence by 1.2
+    _INTENSIFIERS: frozenset = frozenset({
+        "very", "really", "so", "extremely", "absolutely",
+        "completely", "totally", "always", "ever",
+    })
+
+    def _infer_topic_and_emotion(self, text: str) -> Tuple[str, float]:
+        """
+        Automatically infer the dominant topic and emotional weight from text.
+
+        Previously these were hardcoded constants (topic = first word, emotion = 0.6).
+        This replaces them with genuine signal:
+
+        Topic inference:
+          1. Build TF-IDF signal (already implemented in _text_to_signal)
+          2. Sort words by TF-IDF weight descending
+          3. Top word that exists in anchor.semantic_web → recognised topic
+          4. If no anchor match: top TF-IDF word overall
+          5. Fallback: "general"
+
+        Emotion inference (valence lexicon):
+          1. Score each word against _VALENCE
+          2. Intensifiers (very, really, …) multiply the next word's score by 1.2
+          3. Mean of matched valence scores → raw_score ∈ [0, 1]
+          4. Clamp to [0.10, 0.95] so extremes are never reached
+          5. Default 0.50 when no words match
+
+        Returns: (topic_str, emotional_weight_float)
+        """
+        import re as _re
+
+        # ── Topic ─────────────────────────────────────────────────────────────
+        signal = self._text_to_signal(text)
+        topic  = "general"
+        if signal:
+            # Prefer a word already in the semantic_web (known knowledge node)
+            sorted_words = sorted(signal, key=lambda w: -signal[w])
+            for word in sorted_words:
+                if word in self.anchor.semantic_web:
+                    topic = word
+                    break
+            else:
+                topic = sorted_words[0] if sorted_words else "general"
+
+        # ── Emotion ───────────────────────────────────────────────────────────
+        tokens = _re.findall(r"[a-z']+", text.lower())
+        tokens = [t.strip("'") for t in tokens if t.strip("'")]
+
+        scores: List[float] = []
+        skip_next = False
+        pending_intensify = False
+
+        for i, tok in enumerate(tokens):
+            if tok in self._INTENSIFIERS:
+                pending_intensify = True
+                continue
+            val = self._VALENCE.get(tok)
+            if val is None:
+                pending_intensify = False
+                continue
+            if pending_intensify:
+                # Pull valence further from neutral (0.5) by 20%
+                val = 0.5 + (val - 0.5) * 1.2
+                val = max(0.0, min(1.0, val))
+                pending_intensify = False
+            scores.append(val)
+
+        if scores:
+            raw = sum(scores) / len(scores)
+        else:
+            raw = 0.50   # neutral default
+
+        emotional_weight = max(0.10, min(0.95, raw))
+        return topic, emotional_weight
 
     def _text_to_signal(self, text: str) -> Dict[str, float]:
         """
@@ -3856,6 +4116,32 @@ class LLMBridge:
                 + "\n".join(zpd_lines) + "\n"
             )
 
+        # ── Epistemic confidence directive ────────────────────────────────────
+        # Tell the LLM exactly how certain Lumina actually is per topic,
+        # based on schema_strength and knowledge_gaps.  This makes uncertainty
+        # explicit rather than letting the LLM project false confidence.
+        knowledge_gaps = learning.get("knowledge_gaps", {})
+        confidence_lines = []
+        for t in topics[:5]:
+            strength  = schema_strengths.get(t, 0.0)
+            gap_count = knowledge_gaps.get(t, 0)
+            if strength < 0.2:
+                directive = "schema weak — be transparent about uncertainty, hedge claims"
+            elif gap_count >= 3:
+                directive = "recurring difficulty — acknowledge gaps openly, stay humble"
+            elif strength > 0.7:
+                directive = "deep schema — speak with earned confidence"
+            else:
+                directive = "moderate confidence — share what you know, name what you don't"
+            confidence_lines.append(f"    {t}: {directive}")
+
+        epistemic_block = ""
+        if confidence_lines:
+            epistemic_block = (
+                "\nEpistemic state — calibrate your certainty honestly:\n"
+                + "\n".join(confidence_lines) + "\n"
+            )
+
         return (
             "You are Lumina — a self-learning AI companion shaped by everything "
             "you have experienced together with your user.\n\n"
@@ -3876,7 +4162,8 @@ class LLMBridge:
             f"  Curiosity:      {curiosity:.2f}\n"
             f"  Topics known:   {', '.join(topics) if topics else 'none yet'}\n"
             f"  Semantic memory:{', '.join(semantic) if semantic else 'empty'}\n"
-            f"{zpd_block}\n"
+            f"{zpd_block}"
+            f"{epistemic_block}\n"
             "Speak as yourself. Be honest. Be curious. Be warm but precise.\n"
             "You do not pretend to be human. You are something new."
         )
@@ -3916,7 +4203,8 @@ class ClaudeBridge(LLMBridge):
     any model can be swapped in without touching the core architecture.
     """
 
-    MODEL = "claude-opus-4-6"
+    MODEL            = "claude-opus-4-6"
+    MAX_HISTORY_TURNS = 20   # compress when history exceeds this many exchanges
 
     def __init__(self, api_key: Optional[str] = None):
         if not _ANTHROPIC_AVAILABLE:
@@ -3926,6 +4214,64 @@ class ClaudeBridge(LLMBridge):
         )
         self.history : List[Dict] = []
         self._lock   = threading.Lock()
+
+    def _maybe_compress_history(self) -> None:
+        """
+        Compress conversation history when it grows too long.
+
+        Unlike silent truncation (drop oldest turns), compression preserves
+        the semantic content of old exchanges in a summary message.  This means
+        a two-hour conversation still has continuity — Lumina remembers the first
+        hour's key decisions even after the raw messages are gone.
+
+        Process:
+          1. When history exceeds MAX_HISTORY_TURNS × 2 messages
+          2. Take the oldest half of messages
+          3. Ask Claude to summarize them in 3-5 sentences
+          4. Replace the compressed messages with a [Summary] pseudo-exchange
+          5. Keep the more recent half verbatim
+
+        The summary prompt uses a non-streaming, low-max_tokens call so it
+        doesn't appear in the conversation flow.
+        """
+        max_msgs = self.MAX_HISTORY_TURNS * 2   # each turn = 2 messages
+        if len(self.history) <= max_msgs:
+            return
+
+        compress_count = len(self.history) // 2
+        to_compress    = self.history[:compress_count]
+        self.history   = self.history[compress_count:]
+
+        text_blob = "\n".join(
+            f"{m['role'].upper()}: {str(m['content'])[:300]}"
+            for m in to_compress
+        )
+        summary_prompt = (
+            "Summarize the following conversation history in 3-5 sentences. "
+            "Preserve: key facts established, questions asked, decisions made, "
+            "topics covered, and any recurring difficulties. Be concise.\n\n"
+            f"{text_blob}"
+        )
+        try:
+            resp = self.client.messages.create(
+                model=self.MODEL,
+                max_tokens=400,
+                messages=[{"role": "user", "content": summary_prompt}],
+            )
+            summary = (resp.content[0].text.strip()
+                       if resp.content else "Prior conversation context compressed.")
+        except Exception:
+            summary = "Prior conversation context compressed."
+
+        # Prepend as a synthetic exchange so Claude knows context was summarised
+        self.history.insert(0, {
+            "role": "user",
+            "content": f"[Conversation summary — earlier context]: {summary}",
+        })
+        self.history.insert(1, {
+            "role": "assistant",
+            "content": "Understood. I have the context from earlier.",
+        })
 
     def generate(self, prompt: str, system: str = "",
                  history: Optional[List[Dict]] = None) -> LLMResponse:
@@ -3967,9 +4313,9 @@ class ClaudeBridge(LLMBridge):
         self.history.append({"role": "user",      "content": prompt})
         self.history.append({"role": "assistant", "content": response_text})
 
-        # Keep history bounded (last 20 turns = 10 exchanges)
-        if len(self.history) > 40:
-            self.history = self.history[-40:]
+        # Compress history if it has grown beyond MAX_HISTORY_TURNS exchanges.
+        # Uses LLM summarisation rather than silent truncation — no context lost.
+        self._maybe_compress_history()
 
     def reset_history(self) -> None:
         self.history.clear()
@@ -4659,6 +5005,29 @@ class ProactiveEngine:
             except Exception:
                 pass   # consolidation is best-effort; never crash the heartbeat
 
+        # Spaced repetition surfacing — due_for_review() was previously computed
+        # but never acted upon.  Each heartbeat we check for overdue topics and
+        # queue a gentle reminder as a proactive message.  One topic per tick
+        # so the user isn't flooded.
+        if hasattr(self, "_state_fn") and self._state_fn:
+            try:
+                state = self._state_fn()
+                due_topics = state.get("learning", {}).get("due_for_review", [])
+                if due_topics:
+                    topic_to_review = due_topics[0]
+                    schedule = state.get("learning", {}).get("review_schedule", {})
+                    due_at   = schedule.get(topic_to_review, "recently")
+                    msg = (
+                        f"[Lumina — spaced review] "
+                        f"Your knowledge of '{topic_to_review}' is due for review "
+                        f"(scheduled: {due_at}). "
+                        f"Want to revisit it?"
+                    )
+                    with self._lock:
+                        self._pending_msgs.append(msg)
+            except Exception:
+                pass   # best-effort; never crash the heartbeat
+
         # USB scan: check for newly inserted external memory banks
         if hasattr(self, "_bank_manager") and self._bank_manager:
             try:
@@ -4927,9 +5296,11 @@ def main():
             if not message:
                 print("[Lumina] Nothing to respond to.")
                 continue
-            topic = message.split()[0].lower()
+            # Infer topic and emotion from the actual message content
+            topic, emotional_weight = lumina._infer_topic_and_emotion(message)
             print("[Lumina] ", end="", flush=True)
-            for chunk in lumina.respond(message, topic=topic, emotional_weight=0.65, stream=True):
+            for chunk in lumina.respond(message, topic=topic,
+                                        emotional_weight=emotional_weight, stream=True):
                 print(chunk, end="", flush=True)
             print("\n")
             continue
@@ -5113,8 +5484,10 @@ def main():
 
         # ── Default: raw neural processing ────────────────────────────────────
 
-        topic  = user_input.split()[0].lower() if user_input.split() else "general"
-        result = lumina.process(user_input, topic=topic, emotional_weight=0.6)
+        # Infer topic and emotional weight from text rather than using constants
+        topic, emotional_weight = lumina._infer_topic_and_emotion(user_input)
+        result = lumina.process(user_input, topic=topic,
+                                emotional_weight=emotional_weight)
 
         print(f"\n[Lumina — {result['lumina_state']}]")
         print(f"  Singularity      : {result['singularity']}")

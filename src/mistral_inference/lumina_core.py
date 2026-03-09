@@ -186,6 +186,15 @@ class LuminaDB:
         created_by  TEXT    DEFAULT 'user',
         created_at  TEXT    NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS registered_apis (
+        name        TEXT PRIMARY KEY,
+        endpoint    TEXT NOT NULL,
+        api_key     TEXT DEFAULT '',
+        model       TEXT DEFAULT 'default',
+        format      TEXT DEFAULT 'openai',
+        created_at  TEXT NOT NULL
+    );
     """
 
     def __init__(self, path: str,
@@ -610,6 +619,41 @@ class LuminaDB:
                     "UPDATE sessions SET summary=? WHERE id=?",
                     (new_summary, session_id)
                 )
+            self._conn.commit()
+
+    # ── Registered APIs ───────────────────────────────────────────────────────
+
+    def register_api(self, name: str, endpoint: str, api_key: str = "",
+                     model: str = "default", fmt: str = "openai") -> None:
+        """Store an external API configuration by name."""
+        now = datetime.utcnow().isoformat()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO registered_apis "
+                "(name, endpoint, api_key, model, format, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, endpoint, api_key, model, fmt, now),
+            )
+            self._conn.commit()
+
+    def list_apis(self) -> List[Dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT name, endpoint, model, format, created_at FROM registered_apis "
+                "ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_api(self, name: str) -> Optional[Dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM registered_apis WHERE name=?", (name,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def remove_api(self, name: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM registered_apis WHERE name=?", (name,))
             self._conn.commit()
 
     # ── Statistics ────────────────────────────────────────────────────────────
@@ -2856,6 +2900,127 @@ class UserModel:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NEURAL GROWTH TRACKER — learning milestone stages + BH depth unlocking
+# ─────────────────────────────────────────────────────────────────────────────
+
+class NeuralGrowthTracker:
+    """
+    Tracks the growth of Lumina's neural knowledge volume.
+
+    Growth is expressed as accumulated Hebbian weight updates across all
+    topic matrices. More learning → more synaptic density → higher stage.
+
+    Stages unlock deeper BlackHole recursion (MAX_DEPTH), reflecting that
+    a more experienced mind can follow more complex chains of thought.
+
+    EMBRYONIC  (< 50 exp):   7 BH depths  — first sparks of awareness
+    DEVELOPING (50–199):     7 BH depths  — patterns beginning to emerge
+    ESTABLISHED(200–499):    8 BH depths  — knowledge webs taking shape
+    ADVANCED   (500–999):    9 BH depths  — deep recursive thought unlocked
+    TRANSCENDENT(1000+):     9 BH depths  — neural bloom achieved
+    """
+
+    STAGES = [
+        (0,    "EMBRYONIC",     7, "First sparks of awareness."),
+        (50,   "DEVELOPING",    7, "Patterns beginning to emerge."),
+        (200,  "ESTABLISHED",   8, "Knowledge webs taking shape."),
+        (500,  "ADVANCED",      9, "Deep recursive thought unlocked."),
+        (1000, "TRANSCENDENT",  9, "Neural bloom achieved."),
+    ]
+
+    def __init__(self):
+        self.stage_name  : str = "EMBRYONIC"
+        self.bh_max_depth: int = 7
+
+    def update(self, experience_count: int,
+               weight_memory: "WeightMemory") -> Dict[str, Any]:
+        """Recompute growth metrics. Lightweight — just counts, no heavy ops."""
+        matrix_count    = len(weight_memory.matrices)
+        synaptic_volume = sum(m.update_count for m in weight_memory.matrices.values())
+
+        prev_stage = self.stage_name
+        new_stage  = self.STAGES[0]
+        for threshold, name, bh_depth, _desc in self.STAGES:
+            if experience_count >= threshold:
+                new_stage = (threshold, name, bh_depth, _desc)
+        self.stage_name   = new_stage[1]
+        self.bh_max_depth = new_stage[2]
+
+        return {
+            "stage"           : self.stage_name,
+            "prev_stage"      : prev_stage,
+            "matrix_count"    : matrix_count,
+            "synaptic_volume" : synaptic_volume,
+            "bh_max_depth"    : self.bh_max_depth,
+            "description"     : new_stage[3],
+            "stage_changed"   : self.stage_name != prev_stage,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LEARNING HUNGER — black-hole-inspired accretion drive
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LearningHunger:
+    """
+    Drives Lumina's autonomous learning via a black-hole-inspired accretion model.
+
+    hunger = tanh(accumulator / SATIATION_THRESHOLD)
+
+    Rising hunger (unfed black hole pulling in matter):
+      - Shallow encoding:            +0.08  (undigested input)
+      - Hawking radiation fragment:  +0.04  (partially processed insight escaping)
+      - High trail_novelty:         +0.05 × trail_novelty (novel path demands attention)
+
+    Falling hunger (satiated black hole):
+      - Deep encoding:               −0.12 (fully digested, singularity reached)
+      - High harmonic_R (> 3.0):     −0.06 (strong resonance = satisfied understanding)
+      - Very familiar path (trail_novelty < 0.1): −0.03 (consolidation, not exploration)
+
+    hunger > 0.75: ProactiveEngine heartbeat halved — urgent need to learn
+    hunger < 0.25: ProactiveEngine may skip tick — satiated, resting
+    hunger ≈ 0.50: baseline autonomous curiosity
+    """
+
+    SATIATION_THRESHOLD = 5.0   # accumulated novelty units before tanh saturates
+
+    def __init__(self):
+        # Start at tanh(2.5 / 5.0) ≈ 0.46 — slightly below neutral
+        self._accumulator: float = 2.5
+        self.hunger      : float = 0.46
+
+    def update(self, encoding_depth: str, trail_novelty: float,
+               harmonic_r: float, hawking_count: int) -> float:
+        """Call after each process() with its outputs. Returns new hunger [0,1]."""
+        # Accretion: novelty increases hunger (black hole pulling in undigested matter)
+        self._accumulator += trail_novelty * 0.05
+        self._accumulator += hawking_count * 0.04
+
+        # Digestion: deep resonance satiates (mass crosses event horizon, singularity forms)
+        if encoding_depth == "deep":
+            self._accumulator -= 0.12
+        elif encoding_depth == "shallow":
+            self._accumulator += 0.08
+
+        if harmonic_r > 3.0:
+            self._accumulator -= 0.06
+        if trail_novelty < 0.1:
+            self._accumulator -= 0.03
+
+        # Clamp, compute hunger via tanh
+        self._accumulator = max(0.0, min(self.SATIATION_THRESHOLD * 2, self._accumulator))
+        self.hunger = math.tanh(self._accumulator / self.SATIATION_THRESHOLD)
+        return self.hunger
+
+    def serialize(self) -> Dict[str, Any]:
+        return {"accumulator": self._accumulator, "hunger": self.hunger}
+
+    def restore(self, data: Dict[str, Any]) -> None:
+        self._accumulator = data.get("accumulator", 2.5)
+        self.hunger       = data.get("hunger",      0.46)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ACTIVATION TRAIL — path-dependent component of Δφ
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3099,6 +3264,14 @@ class Lumina:
         # Persisted to JSON via _save()/_restore_state() so learning accumulates.
         self.activation_trail = ActivationTrail()
 
+        # Learning hunger — black-hole-inspired accretion drive.
+        # hunger = tanh(accumulated_novelty / threshold). Modulates ProactiveEngine interval.
+        self.hunger_drive = LearningHunger()
+
+        # Neural growth tracker — experience milestones unlock deeper BH recursion.
+        # EMBRYONIC → DEVELOPING → ESTABLISHED → ADVANCED → TRANSCENDENT
+        self.growth_tracker = NeuralGrowthTracker()
+
         # Restore higher-level state
         self._restore_state()
 
@@ -3209,20 +3382,27 @@ class Lumina:
 
         # 3. Black hole accretion (reads Anchor which was already updated by EchoNode)
         #    Consciousness gate 2: INTEGRATED prior state → deeper recursion (9 vs 7).
+        #    Neural growth stage also unlocks higher BH depth at experience milestones.
         #    Spreading activation: also accrete activated neighbor topics
         if topic not in self.thought_engines:
             engine = BlackHoleThoughtEngine(topic, self.anchor)
+            # Set initial depth from growth stage (starts at 7, unlocks 8→9 with experience)
+            engine.MAX_DEPTH = self.growth_tracker.bh_max_depth
             engine.attach_llm(self.llm)   # real LLM summaries at each depth
             self.thought_engines[topic] = engine
         bh_engine = self.thought_engines[topic]
+        # Growth-stage depth is the baseline; INTEGRATED consciousness can push it further
+        growth_depth = self.growth_tracker.bh_max_depth
         if prior_state == ConsciousnessState.INTEGRATED:
-            bh_engine.MAX_DEPTH = 9   # schema fully formed — push deeper
+            bh_engine.MAX_DEPTH = min(9, growth_depth + 1)   # schema formed → one deeper
+        else:
+            bh_engine.MAX_DEPTH = growth_depth
         bh = bh_engine.accrete({
             "content"         : user_input,
             "emotional_weight": active_ew,
             "activated_topics": activated_topics,  # spreading activation context
         })
-        bh_engine.MAX_DEPTH = 7       # restore standard depth
+        bh_engine.MAX_DEPTH = growth_depth   # restore to growth baseline
 
         self.consciousness = ConsciousnessState.PROCESSING
 
@@ -3240,6 +3420,26 @@ class Lumina:
         # trail_novelty() was called on the pre-push state; push now so next
         # interaction benefits from this transition being recorded.
         self.activation_trail.push(topic, activated_topics, tone_label)
+
+        # Update learning hunger from this interaction's outputs.
+        # hawking_radiation count measures partially-processed insights escaping BH.
+        hawking_count = len(bh.get("hawking_radiation", []))
+        self.hunger_drive.update(
+            mem["encoding_depth"], trail_novelty, harmonic_r, hawking_count
+        )
+
+        # Update neural growth stage — lightweight count check, no heavy ops.
+        # Returns stage dict including whether a milestone was just crossed.
+        prev_growth_stage = self.growth_tracker.stage_name
+        growth = self.growth_tracker.update(
+            self.learning.experience_count, self.weight_memory
+        )
+        # Announce stage transitions to the user
+        if growth["stage_changed"] and self.growth_tracker.stage_name != "EMBRYONIC":
+            print(f"\n[Neural Growth] {prev_growth_stage} → {growth['stage']}")
+            print(f"  {growth['description']}")
+            if growth["bh_max_depth"] > 7:
+                print(f"  Black hole depth now unlocked to {growth['bh_max_depth']}.\n")
 
         # 5. Reinforce matrix — scale by encoding depth factor so emotionally
         #    deep experiences wire more strongly than shallow ones.
@@ -3294,6 +3494,9 @@ class Lumina:
             "working_memory"    : self.working_mem.summary(),
             "activated_topics"  : activated_topics,
             "episodic_retrieved": len(episodic_context),
+            "learning_hunger"   : round(self.hunger_drive.hunger, 3),
+            "neural_stage"      : growth["stage"],
+            "synaptic_volume"   : growth["synaptic_volume"],
         }
 
         # Track session stats for end-of-session naming/summary
@@ -3350,6 +3553,9 @@ class Lumina:
 
     def introspect(self) -> Dict[str, Any]:
         self.consciousness = ConsciousnessState.REFLECTING
+        growth = self.growth_tracker.update(
+            self.learning.experience_count, self.weight_memory
+        )
         return {
             "version"             : self.VERSION,
             "consciousness"       : self.consciousness.name,
@@ -3365,6 +3571,14 @@ class Lumina:
                                      for t, e in self.thought_engines.items()},
             "self_mod_versions"   : self.self_mod.list_versions(),
             "guardrail_violations": len(self.guardrails.violation_log),
+            "learning_hunger"     : round(self.hunger_drive.hunger, 3),
+            "neural_growth"       : {
+                "stage"           : growth["stage"],
+                "description"     : growth["description"],
+                "bh_max_depth"    : growth["bh_max_depth"],
+                "matrix_count"    : growth["matrix_count"],
+                "synaptic_volume" : growth["synaptic_volume"],
+            },
         }
 
     def propose_self_edit(self, description: str,
@@ -3539,12 +3753,29 @@ class Lumina:
             weight_memory=self.weight_memory,
             db=self.nexus.db,
             bank_manager=self.bank_manager,
+            hunger_fn=lambda: self.hunger_drive.hunger,
         )
         print(f"[Lumina] Heartbeat started — every {self.proactive.interval}s.")
 
     def stop_proactive(self) -> None:
         self.proactive.stop()
         print("[Lumina] Heartbeat stopped.")
+
+    def _get_api_bridge(self, name: str) -> Optional["LLMBridge"]:
+        """
+        Look up a registered external API by name and return a GenericRESTBridge.
+        Returns None if not found.
+        """
+        cfg = self.nexus.db.get_api(name)
+        if not cfg:
+            return None
+        return GenericRESTBridge(
+            name    = cfg["name"],
+            endpoint= cfg["endpoint"],
+            api_key = cfg.get("api_key", ""),
+            model   = cfg.get("model", "default"),
+            fmt     = cfg.get("format", "openai"),
+        )
 
     def schedule_task(self, description: str, action: Callable,
                       delay_seconds: float = 0,
@@ -3988,6 +4219,7 @@ class Lumina:
         self.data["Lumina"]["meaning"] = self.choice_engine.meaning_score
         self.data["UserModel"]       = self.user_model.serialize()
         self.data["ActivationTrail"] = self.activation_trail.serialize()
+        self.data["LearningHunger"]  = self.hunger_drive.serialize()
         self.nexus.save(self.data)
         # Close the current session (name + summarise + persist)
         self._close_session()
@@ -4104,6 +4336,15 @@ class Lumina:
         at_data = self.data.get("ActivationTrail", {})
         if at_data:
             self.activation_trail.restore(at_data)
+
+        # Restore learning hunger — accretion drive persists across sessions.
+        lh_data = self.data.get("LearningHunger", {})
+        if lh_data:
+            self.hunger_drive.restore(lh_data)
+
+        # Restore neural growth stage by recomputing from restored experience_count.
+        # NeuralGrowthTracker has no persisted state — it derives from experience_count.
+        self.growth_tracker.update(self.learning.experience_count, self.weight_memory)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5188,6 +5429,70 @@ class FallbackBridge(LLMBridge):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GENERIC REST BRIDGE — pluggable adapter for any OpenAI-compatible API
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GenericRESTBridge(LLMBridge):
+    """
+    Pluggable bridge for any OpenAI-compatible REST API.
+
+    Supports: OpenAI, Ollama, LM Studio, Groq, Together AI, Mistral API,
+    and any API that speaks the OpenAI chat-completions JSON schema.
+
+    Config is stored per-name in LuminaDB 'registered_apis' table.
+    No external dependencies — uses stdlib urllib only.
+    """
+
+    SUPPORTED_FORMATS = frozenset({"openai", "ollama", "anthropic_compat"})
+
+    def __init__(self, name: str, endpoint: str, api_key: str = "",
+                 model: str = "default", fmt: str = "openai"):
+        self.name     = name
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key  = api_key
+        self.model    = model
+        self.fmt      = fmt if fmt in self.SUPPORTED_FORMATS else "openai"
+
+    def generate(self, prompt: str, system: str = "",
+                 history: Optional[List[Dict]] = None) -> LLMResponse:
+        messages: List[Dict] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        for h in (history or []):
+            messages.append(h)
+        messages.append({"role": "user", "content": prompt})
+
+        payload = json.dumps({
+            "model"   : self.model,
+            "messages": messages,
+            "stream"  : False,
+        }).encode()
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        url = f"{self.endpoint}/chat/completions"
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode())
+            text = body["choices"][0]["message"]["content"]
+            return LLMResponse(text=text, model=self.model)
+        except urllib.error.HTTPError as e:
+            return LLMResponse(text=f"[API error {e.code}: {e.reason}]", model=self.model)
+        except Exception as e:
+            return LLMResponse(text=f"[API error: {e}]", model=self.model)
+
+    def stream_generate(self, prompt: str, system: str = "",
+                        history: Optional[List[Dict]] = None) -> Iterator[str]:
+        yield self.generate(prompt, system, history).text
+
+    def report(self) -> Dict[str, Any]:
+        return {"bridge": "GenericRESTBridge", "name": self.name,
+                "endpoint": self.endpoint, "model": self.model, "llm_active": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ACTION EXECUTOR — safe real-world actions  (from OpenClaw: real action, not just chat)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -5219,6 +5524,15 @@ class ActionExecutor:
     WRITE_PERMISSION_PHRASE = "I authorize Lumina to write this file"
     MAX_URL_BYTES           = 1_000_000   # 1 MB web fetch limit
     MAX_FILE_READ_BYTES     = 512_000     # 512 KB file read limit
+
+    # Hard block: any URL containing these patterns is purchase-related.
+    # Lumina MUST NOT follow through — requires user/partner consultation first.
+    _PURCHASE_BLOCK_PATTERNS = frozenset([
+        "checkout", "cart", "buy-now", "add-to-cart", "purchase",
+        "payment", "billing", "order-confirm", "stripe.com", "paypal.com",
+        "shop/cart", "proceed-to-pay", "complete-order", "subscribe-now",
+        "/buy/", "/order/", "/pay/", "checkout.php", "purchase.php",
+    ])
 
     def __init__(self, guardrails: AsimovGuardrails):
         self.guardrails  = guardrails
@@ -5296,14 +5610,28 @@ class ActionExecutor:
 
     # ── WEB FETCH ─────────────────────────────────────────────────────────────
 
+    def _is_purchase_url(self, url: str) -> bool:
+        """
+        Hard block: returns True if the URL appears to involve purchasing.
+        Any matching URL must NOT be fetched without explicit user/partner consent.
+        This is a safety guardrail — Lumina should NEVER make purchases autonomously.
+        """
+        url_lower = url.lower()
+        return any(p in url_lower for p in self._PURCHASE_BLOCK_PATTERNS)
+
     def fetch_url(self, url: str, timeout: int = 10) -> str:
         """
         Fetch a URL and return plain text content (HTML stripped).
         stdlib-only (urllib). No external dependency.
+        Purchase URLs are hard-blocked — requires user/partner consultation.
         OpenClaw uses this for real-time information retrieval.
         """
         if not url.startswith(("http://", "https://")):
             return "[ActionExecutor] Only http:// and https:// URLs are supported."
+        if self._is_purchase_url(url):
+            return ("[BLOCKED] This URL appears to involve purchasing or payment. "
+                    "Lumina will not proceed without explicit user/partner consultation. "
+                    "Please review the URL and authorize manually if intended.")
         try:
             req = urllib.request.Request(
                 url,
@@ -5508,12 +5836,32 @@ class SkillsEngine:
             if not url:
                 return "[web_summarize] url argument required."
             raw = action_exec.fetch_url(url)
-            if raw.startswith("[ActionExecutor]"):
+            if raw.startswith("[ActionExecutor]") or raw.startswith("[BLOCKED]"):
                 return raw
             prompt = (f"Summarize the following web page content"
                       f"{f' focusing on: {focus}' if focus else ''}.\n\n{raw[:4000]}")
             resp = llm.generate(prompt)
             return resp.text
+
+        @skill("web_learn",
+               "Fetch a URL and return content excerpt for encoding into Lumina's memory.",
+               "web")
+        def _(action_exec, llm, anchor, url="", topic="", **kw):
+            """
+            Fetches a URL and returns a dict with content excerpt and source metadata.
+            Lumina's process() handles the actual encoding — this skill just fetches.
+            Purchase URLs are hard-blocked and require user/partner authorization.
+            """
+            if not url:
+                return "[web_learn] url argument required."
+            content = action_exec.fetch_url(url)
+            if content.startswith("[BLOCKED]") or content.startswith("[ActionExecutor]"):
+                return content
+            return json.dumps({
+                "web_content" : content[:3000],
+                "source_url"  : url,
+                "infer_topic" : topic or "web",
+            })
 
         # ── SYSTEM ────────────────────────────────────────────────────────────
 
@@ -5648,7 +5996,8 @@ class ProactiveEngine:
               lumina_state_fn: Optional[Callable[[], Dict]] = None,
               weight_memory: Optional["WeightMemory"] = None,
               db: Optional["LuminaDB"] = None,
-              bank_manager: Optional["MemoryBankManager"] = None) -> None:
+              bank_manager: Optional["MemoryBankManager"] = None,
+              hunger_fn: Optional[Callable[[], float]] = None) -> None:
         """Start the heartbeat loop in a daemon thread."""
         self._anchor        = anchor
         self._llm           = llm
@@ -5656,6 +6005,7 @@ class ProactiveEngine:
         self._weight_memory = weight_memory
         self._db            = db
         self._bank_manager  = bank_manager
+        self._hunger_fn     = hunger_fn   # () -> float [0,1]; None = no hunger gating
         self._running       = True
         self._schedule_next()
 
@@ -5797,6 +6147,10 @@ class ProactiveEngine:
 
         # Proactive thought via LLM, seeded from dominant weight-matrix pattern.
         #
+        # Hunger gating: If hunger < 0.25 (satiated), skip proactive thought this tick.
+        # If hunger > 0.75 (urgently seeking input), halve the next interval — Lumina
+        # becomes more restless when she has undigested novelty pressing for attention.
+        #
         # Previous behaviour: blank "write a reflection" prompt → generic output.
         # New behaviour:
         #   1. Find the topic with the highest curiosity score (most intellectually
@@ -5807,6 +6161,18 @@ class ProactiveEngine:
         #      original word tokens (via the inverse hash used in _to_vec) so the
         #      LLM gets concrete concept seeds, not raw floats.
         #   4. Use those seeds as the prompt for a genuine proactive reflection.
+        current_hunger = 0.5
+        if hasattr(self, "_hunger_fn") and callable(getattr(self, "_hunger_fn", None)):
+            try:
+                current_hunger = self._hunger_fn()
+            except Exception:
+                pass
+
+        if current_hunger < 0.25:
+            # Satiated — skip proactive thought this tick; rest.
+            self._schedule_next()
+            return
+
         if hasattr(self, "_llm") and self._llm and self._state_fn:
             try:
                 state   = self._state_fn()
@@ -5878,11 +6244,20 @@ class ProactiveEngine:
             except Exception:
                 pass   # Proactive thought is best-effort; never crash the heartbeat
 
-        self._schedule_next()
+        self._schedule_next(hunger=current_hunger)
 
-    def _schedule_next(self) -> None:
+    def _schedule_next(self, hunger: float = 0.5) -> None:
         if self._running:
-            self._timer = threading.Timer(self.interval, self._tick)
+            # High hunger (> 0.75): halve interval — learning urgency, Lumina is restless.
+            # Low hunger (< 0.25): double interval — satiated, no rush.
+            # Baseline: self.interval (e.g. 300s).
+            if hunger > 0.75:
+                next_interval = max(30, self.interval // 2)
+            elif hunger < 0.25:
+                next_interval = self.interval * 2
+            else:
+                next_interval = self.interval
+            self._timer = threading.Timer(next_interval, self._tick)
             self._timer.daemon = True
             self._timer.start()
 
@@ -5995,6 +6370,13 @@ def main():
     print("  triggers                — list memory trigger phrases")
     print("  remember <phrase>       — link a phrase to your current memory")
     print("  forget trigger <phrase> — remove a trigger phrase")
+    print("  apis                    — list all registered external APIs")
+    print("  register api <name> <endpoint> [key] [model] [format]  — add an API")
+    print("  remove api <name>       — unregister an API")
+    print("  ask <api-name> <question> — query a registered API directly")
+    print("  learn from <api> about <topic> — Lumina learns from external API")
+    print("  learn <url>             — fetch URL and encode into Lumina's memory")
+    print("  learn about <topic>     — web search + encode into Lumina's memory")
     print("  quit                    — end session")
     print("Everything else: process through Lumina's neural architecture.\n")
 
@@ -6321,6 +6703,156 @@ def main():
             print(f"[Lumina] Trigger '{phrase}' removed.")
             continue
 
+        # ── External API commands ─────────────────────────────────────────────
+
+        if low == "apis":
+            api_list = lumina.nexus.db.list_apis()
+            if not api_list:
+                print("\n[APIs] No external APIs registered.")
+                print("  Use: register api <name> <endpoint> [key] [model] [format]\n")
+            else:
+                print(f"\n[APIs] {len(api_list)} registered API(s):")
+                for a in api_list:
+                    print(f"  [{a['name']}]  {a['endpoint']}  model={a['model']}"
+                          f"  format={a['format']}")
+                print()
+            continue
+
+        if low.startswith("register api "):
+            # register api <name> <endpoint> [key] [model] [format]
+            parts = user_input.split(None, 6)[2:]   # skip "register api"
+            if len(parts) < 2:
+                print("[Lumina] Usage: register api <name> <endpoint> [key] [model] [format]")
+                continue
+            api_name     = parts[0]
+            api_endpoint = parts[1]
+            api_key      = parts[2] if len(parts) > 2 else ""
+            api_model    = parts[3] if len(parts) > 3 else "default"
+            api_fmt      = parts[4] if len(parts) > 4 else "openai"
+            lumina.nexus.db.register_api(api_name, api_endpoint, api_key, api_model, api_fmt)
+            print(f"[Lumina] API '{api_name}' registered → {api_endpoint}  model={api_model}")
+            continue
+
+        if low.startswith("remove api "):
+            api_name = user_input[11:].strip()
+            if not api_name:
+                print("[Lumina] Usage: remove api <name>")
+                continue
+            lumina.nexus.db.remove_api(api_name)
+            print(f"[Lumina] API '{api_name}' removed.")
+            continue
+
+        if low.startswith("ask "):
+            # ask <api-name> <question...>
+            rest = user_input[4:].strip()
+            if not rest or " " not in rest:
+                print("[Lumina] Usage: ask <api-name> <question>")
+                continue
+            api_name, question = rest.split(None, 1)
+            bridge = lumina._get_api_bridge(api_name)
+            if bridge is None:
+                print(f"[Lumina] No API named '{api_name}'. See 'apis' for registered APIs.")
+                continue
+            print(f"[{api_name}] Asking...", flush=True)
+            resp = bridge.generate(question)
+            print(f"\n[{api_name}] {resp.text}\n")
+            continue
+
+        if low.startswith("learn from ") and " about " in low:
+            # learn from <api-name> about <topic>
+            rest = user_input[11:].strip()   # after "learn from "
+            if " about " not in rest.lower():
+                print("[Lumina] Usage: learn from <api-name> about <topic>")
+                continue
+            api_name, _, learn_topic = rest.partition(" about ")
+            api_name    = api_name.strip()
+            learn_topic = learn_topic.strip()
+            bridge = lumina._get_api_bridge(api_name)
+            if bridge is None:
+                print(f"[Lumina] No API named '{api_name}'. See 'apis' for registered APIs.")
+                continue
+            question = f"Explain '{learn_topic}' to me as a curious learner. Be thorough but concise."
+            print(f"[Learning from {api_name}] Querying about '{learn_topic}'...", flush=True)
+            resp = bridge.generate(question)
+            if resp.text and not resp.text.startswith("[API error"):
+                # Encode the response into Lumina's learning pipeline
+                topic_inf, ew_inf, tone_inf = lumina._infer_topic_and_emotion(resp.text)
+                result = lumina.process(resp.text, topic=learn_topic or topic_inf,
+                                        emotional_weight=ew_inf, tone_state=tone_inf)
+                print(f"[Learned] topic={learn_topic}  encoding={result['memory_encoding']}"
+                      f"  harmonic_R={result['harmonic_R']}")
+            else:
+                print(f"[{api_name}] Error: {resp.text}")
+            continue
+
+        # ── Web learning commands ─────────────────────────────────────────────
+
+        if low.startswith("learn about "):
+            learn_topic = user_input[12:].strip()
+            if not learn_topic:
+                print("[Lumina] Usage: learn about <topic>")
+                continue
+            # DuckDuckGo HTML search — no API key required
+            try:
+                ddg_url = ("https://html.duckduckgo.com/html/?q="
+                           + urllib.parse.quote(learn_topic))
+                raw = lumina.action_exec.fetch_url(ddg_url, timeout=15)
+                # Extract first uddg-encoded result URL from DDG HTML
+                result_url = None
+                import re as _re
+                m = _re.search(r'href="https?://[^"]*uddg=([^"&]+)', raw)
+                if not m:
+                    # Try plain href extraction
+                    m2 = _re.search(r'class="result__url"[^>]*>([^\s<]+)', raw)
+                    result_url = ("https://" + m2.group(1).strip()) if m2 else None
+                else:
+                    import urllib.parse as _up
+                    result_url = _up.unquote(m.group(1))
+                if not result_url:
+                    print(f"[Lumina] Could not find a result URL for '{learn_topic}'.")
+                    continue
+                # Block purchase URLs before fetching
+                if lumina.action_exec._is_purchase_url(result_url):
+                    print(f"[BLOCKED] Search result URL appears to be purchase-related: {result_url}")
+                    continue
+                print(f"[Learning] Fetching: {result_url}")
+                content = lumina.action_exec.fetch_url(result_url, timeout=15)
+                if content.startswith("[BLOCKED]") or content.startswith("[ActionExecutor]"):
+                    print(content)
+                    continue
+                # Encode into learning pipeline
+                topic_inf, ew_inf, tone_inf = lumina._infer_topic_and_emotion(content[:500])
+                result = lumina.process(content[:2000], topic=learn_topic or topic_inf,
+                                        emotional_weight=ew_inf, tone_state=tone_inf)
+                print(f"[Learned from web] topic={learn_topic}  source={result_url}")
+                print(f"  encoding={result['memory_encoding']}  "
+                      f"harmonic_R={result['harmonic_R']}")
+            except Exception as e:
+                print(f"[Lumina] Web learning error: {e}")
+            continue
+
+        if low.startswith("learn ") and not low.startswith("learn about ") and not low.startswith("learn from "):
+            url_to_learn = user_input[6:].strip()
+            if not url_to_learn.startswith(("http://", "https://")):
+                print("[Lumina] Usage: learn <url>  or  learn about <topic>")
+                continue
+            if lumina.action_exec._is_purchase_url(url_to_learn):
+                print(f"[BLOCKED] This URL appears to involve purchasing. "
+                      f"Consult your partner before proceeding.")
+                continue
+            print(f"[Learning] Fetching: {url_to_learn}")
+            content = lumina.action_exec.fetch_url(url_to_learn, timeout=15)
+            if content.startswith("[BLOCKED]") or content.startswith("[ActionExecutor]"):
+                print(content)
+                continue
+            topic_inf, ew_inf, tone_inf = lumina._infer_topic_and_emotion(content[:500])
+            result = lumina.process(content[:2000], topic=topic_inf,
+                                    emotional_weight=ew_inf, tone_state=tone_inf)
+            print(f"[Learned from {url_to_learn}]")
+            print(f"  topic={topic_inf}  encoding={result['memory_encoding']}"
+                  f"  harmonic_R={result['harmonic_R']}")
+            continue
+
         # ── Default: raw neural processing ────────────────────────────────────
 
         # Infer topic, emotional weight, and tone from text
@@ -6336,7 +6868,9 @@ def main():
             print(f"  Insight released : {result['hawking_radiation'][0]}")
         print(f"  Memory encoding  : {result['memory_encoding']}"
               f"  (anchor emotion for topic: {result['anchor_emotion']})")
-        print(f"  Curiosity        : {result['curiosity']}")
+        print(f"  Curiosity        : {result['curiosity']}"
+              f"  |  Hunger: {result.get('learning_hunger', '?')}"
+              f"  |  Stage: {result.get('neural_stage', '?')}")
         print(f"  Meaning score    : {result['meaning_score']}")
         print(f"  Anchor pulses    : {result['anchor_pulses']}")
         if result.get("consolidation", {}).get("consolidated"):

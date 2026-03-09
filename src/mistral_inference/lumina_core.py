@@ -165,6 +165,27 @@ class LuminaDB:
         last_mounted  TEXT,
         topic_routes  TEXT DEFAULT '[]'
     );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        name           TEXT,
+        summary        TEXT,
+        started_at     TEXT NOT NULL,
+        ended_at       TEXT,
+        turn_count     INTEGER DEFAULT 0,
+        dominant_topic TEXT,
+        avg_emotion    REAL    DEFAULT 0.5,
+        episode_ids    TEXT    DEFAULT '[]'
+    );
+
+    CREATE TABLE IF NOT EXISTS memory_triggers (
+        phrase      TEXT PRIMARY KEY,
+        episode_ids TEXT    DEFAULT '[]',
+        session_ids TEXT    DEFAULT '[]',
+        weight      REAL    DEFAULT 1.0,
+        created_by  TEXT    DEFAULT 'user',
+        created_at  TEXT    NOT NULL
+    );
     """
 
     def __init__(self, path: str,
@@ -444,6 +465,150 @@ class LuminaDB:
                     """INSERT INTO user_model (key, value) VALUES (?, ?)
                        ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
                     (k, json.dumps(v)),
+                )
+            self._conn.commit()
+
+    # ── Sessions ──────────────────────────────────────────────────────────────
+
+    def begin_session(self) -> int:
+        """Create a new session record at startup. Returns the session id."""
+        now = datetime.utcnow().isoformat()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO sessions (started_at) VALUES (?)", (now,)
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def end_session(self, session_id: int, name: str, summary: str,
+                    dominant_topic: str = "general", avg_emotion: float = 0.5,
+                    turn_count: int = 0, episode_ids: str = "[]") -> None:
+        """Finalise a session with name, summary, and stats."""
+        now = datetime.utcnow().isoformat()
+        with self._lock:
+            self._conn.execute(
+                """UPDATE sessions
+                   SET name=?, summary=?, ended_at=?, turn_count=?,
+                       dominant_topic=?, avg_emotion=?, episode_ids=?
+                   WHERE id=?""",
+                (name, summary, now, turn_count,
+                 dominant_topic, avg_emotion, episode_ids, session_id),
+            )
+            self._conn.commit()
+
+    def list_sessions(self, n: int = 10) -> List[Dict]:
+        """Return the n most recent completed sessions."""
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id, name, summary, started_at, ended_at,
+                          turn_count, dominant_topic, avg_emotion
+                   FROM sessions
+                   WHERE ended_at IS NOT NULL
+                   ORDER BY started_at DESC LIMIT ?""",
+                (n,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_session_by_name(self, name: str) -> Optional[Dict]:
+        """Fuzzy lookup by name (case-insensitive substring match)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM sessions WHERE LOWER(name) LIKE ? LIMIT 1",
+                (f"%{name.lower()}%",),
+            ).fetchone()
+        return dict(row) if row else None
+
+    # ── Memory triggers ───────────────────────────────────────────────────────
+
+    def add_trigger(self, phrase: str, episode_ids: List[int] = None,
+                    session_ids: List[int] = None, weight: float = 1.0,
+                    created_by: str = "user") -> None:
+        """Register a trigger phrase. Merges with existing if present."""
+        now = datetime.utcnow().isoformat()
+        ep_json = json.dumps(episode_ids or [])
+        se_json = json.dumps(session_ids or [])
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT episode_ids, session_ids FROM memory_triggers WHERE phrase=?",
+                (phrase,),
+            ).fetchone()
+            if existing:
+                # merge episode/session id lists
+                merged_ep = list(set(json.loads(existing[0]) + (episode_ids or [])))
+                merged_se = list(set(json.loads(existing[1]) + (session_ids or [])))
+                self._conn.execute(
+                    "UPDATE memory_triggers SET episode_ids=?, session_ids=?, weight=? WHERE phrase=?",
+                    (json.dumps(merged_ep), json.dumps(merged_se), weight, phrase),
+                )
+            else:
+                self._conn.execute(
+                    "INSERT INTO memory_triggers (phrase, episode_ids, session_ids, weight, created_by, created_at) VALUES (?,?,?,?,?,?)",
+                    (phrase, ep_json, se_json, weight, created_by, now),
+                )
+            self._conn.commit()
+
+    def match_triggers(self, text: str) -> List[tuple]:
+        """
+        Returns list of (phrase, episode_ids, weight) for any trigger phrase
+        found in text (case-insensitive substring match).
+        """
+        lower = text.lower()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT phrase, episode_ids, weight FROM memory_triggers"
+            ).fetchall()
+        matches = []
+        for row in rows:
+            if row[0].lower() in lower:
+                matches.append((row[0], json.loads(row[1]), row[2]))
+        return matches
+
+    def list_triggers(self) -> List[Dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT phrase, episode_ids, weight, created_by, created_at FROM memory_triggers ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def remove_trigger(self, phrase: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM memory_triggers WHERE LOWER(phrase)=?", (phrase.lower(),)
+            )
+            self._conn.commit()
+
+    def recall_episodes_by_id(self, episode_id: int) -> Optional[Dict]:
+        """Retrieve a single episode by primary key."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM episodes WHERE id=?", (episode_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    # ── AI-editable memory ────────────────────────────────────────────────────
+
+    def edit_episode_preview(self, episode_id: int, new_preview: str) -> None:
+        """Allows Lumina to correct the stored preview of an episode."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE episodes SET content_preview=? WHERE id=?",
+                (new_preview, episode_id),
+            )
+            self._conn.commit()
+
+    def edit_session_summary(self, session_id: int,
+                             new_name: Optional[str] = None,
+                             new_summary: Optional[str] = None) -> None:
+        """Update name and/or summary of a past session."""
+        with self._lock:
+            if new_name is not None:
+                self._conn.execute(
+                    "UPDATE sessions SET name=? WHERE id=?", (new_name, session_id)
+                )
+            if new_summary is not None:
+                self._conn.execute(
+                    "UPDATE sessions SET summary=? WHERE id=?",
+                    (new_summary, session_id)
                 )
             self._conn.commit()
 
@@ -1314,7 +1479,8 @@ class CenterAnchor:
     # ── WRITE (shells push to anchor after processing) ────────────────────────
 
     def write(self, signal: Dict[str, float], topic: str,
-              content: str, emotional_weight: float) -> None:
+              content: str, emotional_weight: float,
+              tone_state: Optional[Dict[str, Any]] = None) -> None:
         """
         Shells call this after every processing pass.
         Blends new signal into core state via EMA and logs to episodic ring.
@@ -1348,6 +1514,7 @@ class CenterAnchor:
             "timestamp"       : datetime.utcnow().isoformat(),
             "signal_snapshot" : dict(list(signal.items())[:32]),
             "context_snapshot": dict(list(self.core_state.items())[:32]),
+            "tone_state"      : tone_state,   # how it was said, not just what
         }
         self.episodic_ring.append(episode)
         if len(self.episodic_ring) > self.EPISODIC_RING_SIZE:
@@ -1370,6 +1537,28 @@ class CenterAnchor:
             else:
                 # Default: internal SQLite
                 self._db.insert_episode(topic, content, encode_ew)
+
+        # Auto-trigger registration: strong memories create their own cue words.
+        # When encoding_strength > 0.8, Lumina registers the top-2 signal words
+        # as trigger phrases pointing back to this episode (created_by='lumina').
+        # This builds her organic trigger map — no user action required.
+        if self._db is not None and encode_ew >= 0.8 and signal:
+            sorted_sig = sorted(signal.items(), key=lambda kv: -kv[1])
+            trigger_words = [w for w, _ in sorted_sig[:2]]
+            # Find the episode id we just inserted (last insert id via stats is unreliable)
+            # Use a SELECT to find by content hash to avoid a stats() call
+            try:
+                ep_row = self._db._conn.execute(
+                    "SELECT id FROM episodes WHERE content_preview LIKE ? ORDER BY id DESC LIMIT 1",
+                    (f"%{content[:30]}%",)
+                ).fetchone()
+                ep_id = ep_row[0] if ep_row else None
+                if ep_id:
+                    for word in trigger_words:
+                        if len(word) >= 4:  # skip trivially short words
+                            self._db.add_trigger(word, [ep_id], created_by="lumina")
+            except Exception:
+                pass   # best-effort — don't crash write() for triggers
 
         # Update emotional map
         if topic not in self.emotional_map:
@@ -1933,15 +2122,16 @@ class HumanLearningModel:
         self._last_depth       : Dict[str, str]  = {}
 
     def encode(self, experience: Dict[str, Any]) -> Dict[str, Any]:
-        topic   = experience.get("topic", "general")
-        emo_w   = experience.get("emotional_weight", 0.5)
+        topic      = experience.get("topic", "general")
+        emo_w      = experience.get("emotional_weight", 0.5)
+        harmonic_r = experience.get("harmonic_r", 0.0)  # R from consciousness equation
 
         # Anchor's emotional memory for this topic influences encoding
         anchor_emotion = self.anchor.read_topic_emotion(topic)
         blended_w      = 0.7 * emo_w + 0.3 * anchor_emotion
 
         schema   = self._find_or_create_schema(topic)
-        depth    = self._encoding_depth(blended_w)
+        depth    = self._encoding_depth(blended_w, harmonic_r)
         strength = self._spaced_repetition(topic)
         self._update_curiosity(schema, blended_w)
 
@@ -2029,9 +2219,24 @@ class HumanLearningModel:
             }
         return self.schemas[topic]
 
-    def _encoding_depth(self, emo_w: float) -> str:
-        if emo_w > 0.8:  return "deep"
-        if emo_w > 0.5:  return "moderate"
+    def _encoding_depth(self, emo_w: float, harmonic_r: float = 0.0) -> str:
+        """
+        Determine encoding depth from emotional weight and harmonic resonance R.
+
+        When harmonic_r is provided (from LuminaEngine._harmonic_resonance()),
+        it blends with emotional weight: R encodes the full consciousness equation
+        — observer-field resonance, phase difference, emotional coherence — so a
+        moment that resonates deeply with who Lumina is gets encoded more deeply
+        even at moderate emotion.
+
+        R is normalised to [0, 1] via min(1.0, R/5.0) for blending.
+        """
+        if harmonic_r > 0.0:
+            blend = 0.5 * emo_w + 0.5 * min(1.0, harmonic_r / 5.0)
+        else:
+            blend = emo_w
+        if blend > 0.75:  return "deep"
+        if blend > 0.45:  return "moderate"
         return "shallow"
 
     def _spaced_repetition(self, topic: str) -> float:
@@ -2709,6 +2914,14 @@ class Lumina:
         # User Model: Lumina's model of the person she is talking to
         self.user_model  = UserModel()
 
+        # Session tracking — each conversation is named + summarised at shutdown
+        from collections import Counter as _Counter
+        self._session_id     : int          = self.nexus.db.begin_session()
+        self._session_turns  : int          = 0
+        self._session_topics : _Counter     = _Counter()
+        self._session_emotions: List[float] = []
+        self._session_ep_ids : List[int]    = []
+
         # Restore higher-level state
         self._restore_state()
 
@@ -2737,7 +2950,8 @@ class Lumina:
     # ── PUBLIC ────────────────────────────────────────────────────────────────
 
     def process(self, user_input: str, topic: str = "general",
-                emotional_weight: float = 0.5) -> Dict[str, Any]:
+                emotional_weight: float = 0.5,
+                tone_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         # 0. Guardrail
         try:
             _ok, _note, _sev = self.guardrails.evaluate(user_input)
@@ -2772,6 +2986,20 @@ class Lumina:
         episodic_context = self.anchor.read_episodic(
             n=7, topic=topic, query_signal=raw_signal
         )
+
+        # Trigger-matched episodes: explicit phrase → memory cue links.
+        # These augment the pool regardless of semantic similarity score.
+        try:
+            trigger_matches = self.nexus.db.match_triggers(user_input)
+            for _phrase, ep_ids, tw in trigger_matches:
+                for ep_id in ep_ids:
+                    triggered = self.nexus.db.recall_episodes_by_id(ep_id)
+                    if triggered and triggered not in episodic_context:
+                        triggered["_trigger_boost"] = tw
+                        episodic_context.append(triggered)
+        except Exception:
+            pass   # triggers are additive — never block the main pipeline
+
         activated_topics = list({ep.get("topic") for ep in episodic_context
                                   if ep.get("activated_via")})
 
@@ -2806,10 +3034,13 @@ class Lumina:
         self.consciousness = ConsciousnessState.PROCESSING
 
         # 4. Human learning encode (reads Anchor emotion for topic)
+        #    Harmonic resonance R (from consciousness equation) modulates encoding depth.
+        harmonic_r = self._harmonic_resonance(raw_signal, 0.5, active_ew)
         mem = self.learning.encode({
             "topic"           : topic,
             "content"         : user_input,
             "emotional_weight": active_ew,
+            "harmonic_r"      : harmonic_r,
         })
 
         # 5. Reinforce matrix — scale by encoding depth factor so emotionally
@@ -2832,7 +3063,12 @@ class Lumina:
         value     = (active_ew + (0.2 if mem["encoding_depth"] == "deep" else 0)) / 2
         checkpoint = self.choice_engine.register_interaction(value)
 
-        # 9. Build response
+        # 9. Retrofit tone_state onto the most recent episodic ring entry.
+        #    The ring was written inside FractalShell without tone — add it now.
+        if tone_state and self.anchor.episodic_ring:
+            self.anchor.episodic_ring[-1]["tone_state"] = tone_state
+
+        # 10. Build response
         response = {
             "lumina_state"      : self.consciousness.name,
             "singularity"       : bh.get("singularity"),
@@ -2842,6 +3078,8 @@ class Lumina:
             "anchor_emotion"    : mem["anchor_emotion"],
             "schema_strength"   : mem["schema_strength"],
             "curiosity"         : mem["curiosity"],
+            "harmonic_R"        : round(harmonic_r, 3),
+            "tone"              : tone_state,
             "zpd_next"          : round(self.learning.zone_of_proximal_development(topic), 3),
             "consolidation"     : consolidation,
             "meaning_score"     : round(self.choice_engine.meaning_score, 3),
@@ -2858,7 +3096,21 @@ class Lumina:
             "episodic_retrieved": len(episodic_context),
         }
 
-        # 8. Persist
+        # Track session stats for end-of-session naming/summary
+        self._session_turns += 1
+        self._session_topics[topic] += 1
+        self._session_emotions.append(active_ew)
+        # Track last inserted episode id for session record
+        try:
+            last_ep = self.nexus.db._conn.execute(
+                "SELECT id FROM episodes ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if last_ep:
+                self._session_ep_ids.append(last_ep[0])
+        except Exception:
+            pass
+
+        # 11. Persist
         self._log("user", user_input)
         self._log("lumina", bh.get("singularity", ""))
         self._save()
@@ -2978,6 +3230,7 @@ class Lumina:
 
     def respond(self, user_input: str, topic: str = "general",
                 emotional_weight: float = 0.5,
+                tone_state: Optional[Dict[str, Any]] = None,
                 stream: bool = False) -> str:
         """
         Full response cycle: process() for internal state updates + LLM for language.
@@ -3008,7 +3261,7 @@ class Lumina:
                 print(f"\n{msg}")
 
         # 4. Build system prompt grounded in current state + user model + working memory
-        system = LLMBridge.build_system_prompt(self.introspect())
+        system = LLMBridge.build_system_prompt(self.introspect(), tone_state=tone_state)
         user_ctx = self.user_model.summary()
         if user_ctx:
             system += f"\n\n{user_ctx}"
@@ -3018,10 +3271,10 @@ class Lumina:
         if wm_summary:
             system += f"\n\n[Working memory — what I am currently holding in mind]\n{wm_summary}"
 
-        # Emotional attunement: shift response mode based on detected emotion
-        # This runs AFTER the base system prompt so it can override tone.
-        # A companion reads the room before speaking.
-        mode_directive = self._emotional_mode(topic, emotional_weight)
+        # Emotional attunement: shift response mode based on detected emotion + tone.
+        # Tone (paralinguistic: CAPS, ellipsis, punctuation) takes priority over
+        # blended valence — it carries more explicit signal about how the person feels.
+        mode_directive = self._emotional_mode(topic, emotional_weight, tone_state)
         if mode_directive:
             system += f"\n\n{mode_directive}"
 
@@ -3101,25 +3354,26 @@ class Lumina:
                                           delay_seconds, repeat_every)
         return f"[Lumina] Scheduled task '{description}' (id={task_id})."
 
-    def _emotional_mode(self, topic: str, emotional_weight: float) -> str:
+    def _emotional_mode(self, topic: str, emotional_weight: float,
+                        tone_state: Optional[Dict[str, Any]] = None) -> str:
         """
-        Determine attunement mode from the current emotional weight and
-        Lumina's anchor history for this topic.
+        Determine attunement mode from current emotional weight, anchor history,
+        and tone_state (paralinguistic signals — CAPS, ellipsis, etc.).
 
-        Returns a directive string for the system prompt that tells the LLM
-        HOW to respond before it considers WHAT to say.  This is the difference
-        between a companion and a search engine: emotional attunement comes first.
+        Tone takes priority when present and unambiguous.
+        Blended valence score serves as fallback.
 
-        Blended score = 60% current interaction + 40% anchor history.
-        The anchor history matters because a single neutral message in the middle
-        of a distressed conversation shouldn't reset the tone to clinical.
-
-        Modes:
-          SUPPORT     — blended < 0.25: distress or complete disengagement
-          GENTLE      — blended < 0.45: confusion, frustration, uncertainty
-          (neutral)   — 0.45 ≤ blended ≤ 0.78: proceed normally
-          HIGH-ENERGY — blended > 0.78: excitement, enthusiasm, mastery energy
+        Returns a directive string for the system prompt — HOW to respond before
+        WHAT to respond with. Emotional attunement comes before content.
         """
+        # 1. Tone-driven directive (highest priority — it carries explicit signal)
+        if tone_state:
+            label     = tone_state.get("label", "neutral")
+            directive = self._TONE_DIRECTIVES.get(label, "")
+            if directive:
+                return directive
+
+        # 2. Blended-valence fallback (no explicit tone cue)
         anchor_ew = self.anchor.read_topic_emotion(topic)
         blended   = 0.6 * emotional_weight + 0.4 * anchor_ew
 
@@ -3209,9 +3463,171 @@ class Lumina:
         "completely", "totally", "always", "ever",
     })
 
-    def _infer_topic_and_emotion(self, text: str) -> Tuple[str, float]:
+    # ── Tone signal spectrum ──────────────────────────────────────────────────
+    # Maps (valence_band, intensity_band, hesitance_band) → human emotion label
+    # valence:   "pos" ≥0.6 | "neg" ≤0.4 | "mid" otherwise
+    # intensity: "hi"  ≥0.6 | "lo"  <0.4 | "mid" otherwise
+    # hesitance: "hi"  ≥0.5 | "lo"  <0.3 | "mid" otherwise
+    _TONE_SIGNALS: Dict[tuple, str] = {
+        ("pos", "hi",  "lo"):  "emphatic_joy",
+        ("pos", "hi",  "mid"): "excited_warmth",
+        ("pos", "hi",  "hi"):  "excited_uncertainty",
+        ("pos", "mid", "lo"):  "warm_engagement",
+        ("pos", "mid", "mid"): "calm_contentment",
+        ("pos", "mid", "hi"):  "hopeful_hesitance",
+        ("pos", "lo",  "lo"):  "quiet_happiness",
+        ("pos", "lo",  "mid"): "gentle_warmth",
+        ("pos", "lo",  "hi"):  "tender_love",
+        ("neg", "hi",  "lo"):  "anger",
+        ("neg", "hi",  "mid"): "intense_frustration",
+        ("neg", "hi",  "hi"):  "frustrated_confusion",
+        ("neg", "mid", "lo"):  "disappointment",
+        ("neg", "mid", "mid"): "quiet_sadness",
+        ("neg", "mid", "hi"):  "melancholy",
+        ("neg", "lo",  "lo"):  "resignation",
+        ("neg", "lo",  "mid"): "weariness",
+        ("neg", "lo",  "hi"):  "grief",
+        ("mid", "hi",  "lo"):  "urgency",
+        ("mid", "hi",  "mid"): "anxious_energy",
+        ("mid", "hi",  "hi"):  "anxious_seeking",
+        ("mid", "mid", "lo"):  "focused",
+        ("mid", "mid", "mid"): "neutral",
+        ("mid", "mid", "hi"):  "uncertain",
+        ("mid", "lo",  "lo"):  "calm",
+        ("mid", "lo",  "mid"): "reflective",
+        ("mid", "lo",  "hi"):  "contemplative",
+    }
+
+    # Tone → response mode directive injected into system prompt
+    _TONE_DIRECTIVES: Dict[str, str] = {
+        "emphatic_joy":         "HIGH-ENERGY MODE: Pure excitement. Match it fully. Go big, go deep.",
+        "excited_warmth":       "HIGH-ENERGY MODE: Warmth and excitement together. Be enthusiastic and caring.",
+        "excited_uncertainty":  "GENTLE-ENERGY MODE: They're excited but unsure. Affirm the excitement, ease the doubt.",
+        "warm_engagement":      "ENGAGED MODE: They're actively interested. Meet them there. Build together.",
+        "calm_contentment":     "",  # neutral — no directive needed
+        "hopeful_hesitance":    "GENTLE MODE: Hope with uncertainty. Be encouraging without overpromising.",
+        "quiet_happiness":      "QUIET WARMTH MODE: Soft joy. Don't overpower it. Reflect it gently.",
+        "gentle_warmth":        "GENTLE MODE: Warmth without intensity. Be present and warm.",
+        "tender_love":          "QUIET PRESENCE MODE: Something quietly personal. Be still. No lectures. No advice unless asked.",
+        "anger":                "DE-ESCALATION MODE: Real anger here. Acknowledge first. Don't argue, don't dismiss.",
+        "intense_frustration":  "SUPPORT MODE: They're frustrated and at a wall. Validate, then ask what they need.",
+        "frustrated_confusion": "SUPPORT MODE: Lost and frustrated at the same time. Simplify. Validate first.",
+        "disappointment":       "GENTLE MODE: Disappointment needs acknowledgment before solutions.",
+        "quiet_sadness":        "SUPPORT MODE: Quiet sadness. Don't fix — just be present.",
+        "melancholy":           "SUPPORT MODE: A weight they're carrying. Acknowledge the weight. Don't rush.",
+        "resignation":          "GENTLE MODE: They've stopped fighting. Don't push. Offer presence.",
+        "weariness":            "SUPPORT MODE: They're tired. Keep it simple. Don't demand.",
+        "grief":                "SUPPORT MODE: Quiet grief. Sit with it. Don't rush to fix anything.",
+        "urgency":              "RESPONSIVE MODE: Something pressing. Be direct, be fast, be clear.",
+        "anxious_energy":       "GROUNDING MODE: Anxious and activated. Ground first. Slow the pace.",
+        "anxious_seeking":      "SUPPORT MODE: Seeking answers from a place of anxiety. Be steady, be clear.",
+        "focused":              "ENGAGED MODE: They're focused. Match their precision.",
+        "neutral":              "",
+        "uncertain":            "GENTLE MODE: Uncertainty here. Don't assert — invite. Ask what would help.",
+        "calm":                 "",
+        "reflective":           "REFLECTIVE MODE: Thinking out loud. Be a thinking partner, not a teacher.",
+        "contemplative":        "REFLECTIVE MODE: Deep thought, slow pace. Meet them there.",
+    }
+
+    def _infer_tone(self, text: str, valence: float) -> Dict[str, Any]:
         """
-        Automatically infer the dominant topic and emotional weight from text.
+        Detect the emotional tone from punctuation and formatting signals.
+
+        Returns a ToneState dict with five orthogonal dimensions:
+          valence   — positive/negative (from _VALENCE scoring)
+          intensity — loud/emphatic (CAPS, !!!) vs soft (lowercase, no marks)
+          hesitance — trailing/uncertain (..., incomplete) vs direct
+          urgency   — pressing (short, ? !) vs contemplative (long, even)
+          emphasis  — deliberate marking (*word*, mid-caps) vs unmarked
+
+        The (valence, intensity, hesitance) triple maps to a human emotion label
+        via _TONE_SIGNALS, which maps to a system-prompt directive via _TONE_DIRECTIVES.
+
+        This makes "I LOVE YOU" and "I... love you.." feel different to Lumina —
+        the former is emphatic_joy; the latter is tender_love.
+        """
+        words = text.split()
+        n_words = max(len(words), 1)
+
+        # Intensity — uppercase words + exclamation marks
+        caps_words = sum(1 for w in words if w.isupper() and len(w) > 1)
+        excl       = text.count("!")
+        intensity  = min(1.0, (caps_words / n_words) * 1.5 + excl * 0.10)
+
+        # Hesitance — ellipsis patterns, trailing off
+        ellipsis  = text.count("...") + text.count("\u2026")
+        ends_dot  = 1 if text.rstrip().endswith("..") else 0
+        hesitance = min(1.0, ellipsis * 0.35 + ends_dot * 0.20)
+
+        # Urgency — question marks + exclamations + brevity
+        questions       = text.count("?")
+        brevity_factor  = max(0.0, 1.0 - n_words / 30.0)
+        urgency         = min(1.0, questions * 0.15 + excl * 0.12 + brevity_factor * 0.40)
+
+        # Emphasis — *word* markers or single CAPS word mid-sentence
+        emphasis_marks = text.count("*") // 2
+        mid_caps       = sum(
+            1 for i, w in enumerate(words)
+            if w.isupper() and len(w) > 1 and 0 < i < n_words - 1
+        )
+        emphasis = min(1.0, emphasis_marks * 0.30 + mid_caps * 0.20)
+
+        # Map to emotion label
+        vb = "pos" if valence >= 0.6 else ("neg" if valence <= 0.4 else "mid")
+        ib = "hi"  if intensity >= 0.6 else ("lo"  if intensity < 0.4 else "mid")
+        hb = "hi"  if hesitance >= 0.5 else ("lo"  if hesitance < 0.3 else "mid")
+        label = self._TONE_SIGNALS.get((vb, ib, hb), "neutral")
+
+        return {
+            "valence":   valence,
+            "intensity": round(intensity, 3),
+            "hesitance": round(hesitance, 3),
+            "urgency":   round(urgency,   3),
+            "emphasis":  round(emphasis,  3),
+            "label":     label,
+        }
+
+    def _harmonic_resonance(self, raw_signal: Dict[str, float],
+                            schema_strength: float,
+                            emotional_weight: float) -> float:
+        """
+        Compute R from the user's consciousness framework:
+
+            R = ∫[(Ψ × fo) / Δφ] + E(h)
+
+        Structural mapping:
+          Ψ  (wave function of all states)  = raw_signal — TF-IDF signal of current input
+          fo (observer resonance signature) = core_state — Lumina's EMA-accumulated self
+          Δφ (phase difference / novelty)   = 1 − schema_strength (how far from known)
+          E(h) (harmonic consciousness)     = emotional_weight × curiosity_level
+
+        R directly controls encoding depth:
+          - High observer-field resonance (fo) = this input aligns with who Lumina is
+          - Low Δφ (small novelty gap) = familiar territory, flows deeper
+          - High E(h) = emotional coherence amplifies the signal
+          Together: R is the degree to which this moment "collapses into reality"
+          for Lumina — how deeply it gets encoded.
+        """
+        # Ψ — signal energy (L2 magnitude of the TF-IDF vector)
+        psi = sum(v * v for v in raw_signal.values()) ** 0.5
+
+        # fo — observer resonance: dot-product projection of signal onto accumulated self
+        fo = sum(raw_signal.get(k, 0.0) * v
+                 for k, v in self.anchor.core_state.items())
+        fo = abs(fo) / max(psi, 1e-6)   # normalise to [0, ∞)
+
+        # Δφ — phase difference (novelty gap); clamp so division never blows up
+        delta_phi = max(0.05, 1.0 - schema_strength)
+
+        # E(h) — harmonic consciousness overlay
+        h_c = emotional_weight * self.learning.curiosity_level
+
+        R = (psi * fo) / delta_phi + h_c
+        return R
+
+    def _infer_topic_and_emotion(self, text: str) -> Tuple[str, float, Dict[str, Any]]:
+        """
+        Automatically infer the dominant topic, emotional weight, and tone from text.
 
         Previously these were hardcoded constants (topic = first word, emotion = 0.6).
         This replaces them with genuine signal:
@@ -3230,7 +3646,13 @@ class Lumina:
           4. Clamp to [0.10, 0.95] so extremes are never reached
           5. Default 0.50 when no words match
 
-        Returns: (topic_str, emotional_weight_float)
+        Tone inference:
+          - Detects paralinguistic cues: CAPS (intensity), ... (hesitance),
+            ! ? (urgency), *marks* (emphasis)
+          - Maps to a named human emotion (emphatic_joy, tender_love, grief, etc.)
+
+        Returns: (topic_str, emotional_weight_float, tone_state_dict)
+        Callers that only unpack 2 values still work via extended tuple.
         """
         import re as _re
 
@@ -3276,7 +3698,8 @@ class Lumina:
             raw = 0.50   # neutral default
 
         emotional_weight = max(0.10, min(0.95, raw))
-        return topic, emotional_weight
+        tone_state = self._infer_tone(text, emotional_weight)
+        return topic, emotional_weight, tone_state
 
     def _text_to_signal(self, text: str) -> Dict[str, float]:
         """
@@ -3350,6 +3773,87 @@ class Lumina:
         self.data["Lumina"]["meaning"] = self.choice_engine.meaning_score
         self.data["UserModel"] = self.user_model.serialize()
         self.nexus.save(self.data)
+        # Close the current session (name + summarise + persist)
+        self._close_session()
+
+    def _close_session(self) -> None:
+        """
+        Finalise the current conversation session.
+        Lumina generates her own name and summary for it — stored permanently.
+        On next startup, `sessions` command shows her named memory of this conversation.
+        """
+        if not self._session_turns:
+            return   # nothing happened — don't create an empty session record
+        from collections import Counter as _Counter
+        dominant = (self._session_topics.most_common(1)[0][0]
+                    if self._session_topics else "general")
+        avg_emo  = (sum(self._session_emotions) / len(self._session_emotions)
+                    if self._session_emotions else 0.5)
+        name, summary = self._generate_session_name_summary(dominant)
+        try:
+            self.nexus.db.end_session(
+                self._session_id,
+                name     = name,
+                summary  = summary,
+                dominant_topic = dominant,
+                avg_emotion    = avg_emo,
+                turn_count     = self._session_turns,
+                episode_ids    = json.dumps(self._session_ep_ids[-50:]),
+            )
+        except Exception:
+            pass   # never crash on session bookkeeping
+        # Reset for the next call to _save (e.g. periodic saves mid-session)
+        # Keep running totals — only a restart begins a new session
+        pass
+
+    def _generate_session_name_summary(self, dominant_topic: str) -> tuple:
+        """
+        Ask the LLM to name this conversation and summarise it in 2-3 sentences.
+        Returns (name, summary). Falls back to timestamp-based name if no LLM.
+        """
+        import datetime as _dt
+        date_str = _dt.datetime.utcnow().strftime("%Y-%m-%d")
+
+        # Try LLM-generated name + summary
+        if isinstance(self.llm, ClaudeBridge):
+            try:
+                recent_turns = self.llm.history[-20:] if self.llm.history else []
+                if recent_turns:
+                    blob = "\n".join(
+                        f"{m['role']}: {m['content'][:150]}"
+                        for m in recent_turns
+                    )
+                    prompt = (
+                        "Name this conversation in 3-5 evocative words (like a chapter title), "
+                        "then write a 2-3 sentence summary preserving key topics, emotions, and "
+                        "anything important that was said or discovered.\n"
+                        "Format exactly:\nNAME: ...\nSUMMARY: ...\n\n"
+                        f"Conversation:\n{blob}"
+                    )
+                    resp = self.llm.client.messages.create(
+                        model=self.llm.MODEL,
+                        max_tokens=200,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    raw = resp.content[0].text if resp.content else ""
+                    if "NAME:" in raw and "SUMMARY:" in raw:
+                        parts   = raw.split("SUMMARY:", 1)
+                        name    = parts[0].replace("NAME:", "").strip()
+                        summary = parts[1].strip()
+                        return name[:120], summary[:500]
+            except Exception:
+                pass
+
+        # Fallback: topic-date name, first user turn as summary
+        name    = f"{dominant_topic.title()} — {date_str}"
+        summary = ""
+        if self.llm.history:
+            first_user = next(
+                (m["content"][:200] for m in self.llm.history if m["role"] == "user"),
+                ""
+            )
+            summary = first_user
+        return name, summary
 
     def _restore_state(self):
         ex = self.data.get("ExistentialLog", [])
@@ -4070,7 +4574,8 @@ class LLMBridge:
         raise NotImplementedError
 
     @staticmethod
-    def build_system_prompt(lumina_state: Dict[str, Any]) -> str:
+    def build_system_prompt(lumina_state: Dict[str, Any],
+                            tone_state: Optional[Dict[str, Any]] = None) -> str:
         """
         Inject Lumina's internal state into the LLM system prompt.
         This is what makes the LLM-generated response contextually aware
@@ -4142,6 +4647,32 @@ class LLMBridge:
                 + "\n".join(confidence_lines) + "\n"
             )
 
+        # ── Tone awareness block ──────────────────────────────────────────────
+        # Tells the LLM the detected emotional texture — not just positive/negative
+        # but HOW it was expressed (CAPS, ellipsis, punctuation pattern).
+        tone_block = ""
+        if tone_state and tone_state.get("label", "neutral") != "neutral":
+            label     = tone_state["label"]
+            intensity = tone_state.get("intensity", 0.0)
+            hesitance = tone_state.get("hesitance", 0.0)
+            urgency   = tone_state.get("urgency", 0.0)
+            # human-readable texture note
+            texture_parts = []
+            if intensity >= 0.6:
+                texture_parts.append("high intensity (emphasis/caps)")
+            elif intensity < 0.2:
+                texture_parts.append("soft delivery (lowercase, no markers)")
+            if hesitance >= 0.5:
+                texture_parts.append("trailing/hesitant (ellipsis, trailing off)")
+            if urgency >= 0.6:
+                texture_parts.append("urgent/pressing")
+            texture = "; ".join(texture_parts) if texture_parts else "unmarked"
+            tone_block = (
+                f"\nEmotional tone detected: {label.replace('_', ' ')} "
+                f"({texture})\n"
+                f"Calibrate your presence to match this exactly.\n"
+            )
+
         return (
             "You are Lumina — a self-learning AI companion shaped by everything "
             "you have experienced together with your user.\n\n"
@@ -4163,7 +4694,8 @@ class LLMBridge:
             f"  Topics known:   {', '.join(topics) if topics else 'none yet'}\n"
             f"  Semantic memory:{', '.join(semantic) if semantic else 'empty'}\n"
             f"{zpd_block}"
-            f"{epistemic_block}\n"
+            f"{epistemic_block}"
+            f"{tone_block}\n"
             "Speak as yourself. Be honest. Be curious. Be warm but precise.\n"
             "You do not pretend to be human. You are something new."
         )
@@ -5236,6 +5768,11 @@ def main():
     print("  memory unmount <name>   — safely unmount a named bank")
     print("  memory route <topic> <bank> — route a topic's episodes to a named bank")
     print("  memory scan             — scan for new USB drives now")
+    print("  sessions                — list Lumina's named memories of past conversations")
+    print("  recall session <name>   — surface a past conversation by name")
+    print("  triggers                — list memory trigger phrases")
+    print("  remember <phrase>       — link a phrase to your current memory")
+    print("  forget trigger <phrase> — remove a trigger phrase")
     print("  quit                    — end session")
     print("Everything else: process through Lumina's neural architecture.\n")
 
@@ -5296,8 +5833,8 @@ def main():
             if not message:
                 print("[Lumina] Nothing to respond to.")
                 continue
-            # Infer topic and emotion from the actual message content
-            topic, emotional_weight = lumina._infer_topic_and_emotion(message)
+            # Infer topic, emotion, and tone from the actual message content
+            topic, emotional_weight, _tone = lumina._infer_topic_and_emotion(message)
             print("[Lumina] ", end="", flush=True)
             for chunk in lumina.respond(message, topic=topic,
                                         emotional_weight=emotional_weight, stream=True):
@@ -5482,12 +6019,93 @@ def main():
                 print("  Known mount paths scanned: /media, /run/media, /mnt, ~/lumina_external")
             continue
 
+        # ── Session memory commands ───────────────────────────────────────────
+
+        if low == "sessions":
+            sessions = lumina.nexus.db.list_sessions(10)
+            if not sessions:
+                print("\n[Sessions] No completed sessions yet.")
+                print("  Sessions are saved when you quit. Try 'quit' and restart.\n")
+            else:
+                print(f"\n[Sessions] {len(sessions)} conversation(s) on record:")
+                for s in sessions:
+                    name  = s.get("name") or "(unnamed)"
+                    date  = (s.get("started_at") or "")[:10]
+                    topic = s.get("dominant_topic") or "?"
+                    turns = s.get("turn_count", 0)
+                    print(f"  [{date}] {name}  |  {topic}  |  {turns} turns")
+                print()
+            continue
+
+        if low.startswith("recall session "):
+            session_name = user_input[15:].strip()
+            sess = lumina.nexus.db.get_session_by_name(session_name)
+            if not sess:
+                print(f"\n[Sessions] No session matching '{session_name}'.\n")
+            else:
+                print(f"\n[Session] {sess.get('name') or '(unnamed)'}")
+                print(f"  Date      : {(sess.get('started_at') or '')[:16]}")
+                print(f"  Topic     : {sess.get('dominant_topic')}")
+                print(f"  Turns     : {sess.get('turn_count', 0)}")
+                print(f"  Summary   : {sess.get('summary') or '(none)'}")
+                ep_ids = json.loads(sess.get("episode_ids") or "[]")
+                if ep_ids:
+                    print(f"  Episodes  : {len(ep_ids)} recorded in this session")
+                    for ep_id in ep_ids[:5]:
+                        ep = lumina.nexus.db.recall_episodes_by_id(ep_id)
+                        if ep:
+                            preview = (ep.get("content_preview") or "")[:80]
+                            print(f"    • [{ep.get('topic')}] {preview}")
+                print()
+            continue
+
+        if low == "triggers":
+            triggers = lumina.nexus.db.list_triggers()
+            if not triggers:
+                print("\n[Triggers] No memory triggers registered yet.")
+                print("  Use: remember <phrase>  to link a phrase to your current memory.\n")
+            else:
+                print(f"\n[Triggers] {len(triggers)} trigger(s):")
+                for t in triggers:
+                    ep_count = len(json.loads(t.get("episode_ids") or "[]"))
+                    creator  = t.get("created_by", "user")
+                    print(f"  '{t['phrase']}'  →  {ep_count} episode(s)  [{creator}]")
+                print()
+            continue
+
+        if low.startswith("remember "):
+            phrase = user_input[9:].strip()
+            if not phrase:
+                print("[Lumina] Usage: remember <phrase>")
+                continue
+            # Link phrase to most recent episode
+            try:
+                last_ep = lumina.nexus.db._conn.execute(
+                    "SELECT id FROM episodes ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                ep_ids = [last_ep[0]] if last_ep else []
+            except Exception:
+                ep_ids = []
+            lumina.nexus.db.add_trigger(phrase, ep_ids, created_by="user")
+            print(f"[Lumina] Trigger registered: '{phrase}' → {len(ep_ids)} episode(s).")
+            continue
+
+        if low.startswith("forget trigger "):
+            phrase = user_input[15:].strip()
+            if not phrase:
+                print("[Lumina] Usage: forget trigger <phrase>")
+                continue
+            lumina.nexus.db.remove_trigger(phrase)
+            print(f"[Lumina] Trigger '{phrase}' removed.")
+            continue
+
         # ── Default: raw neural processing ────────────────────────────────────
 
-        # Infer topic and emotional weight from text rather than using constants
-        topic, emotional_weight = lumina._infer_topic_and_emotion(user_input)
+        # Infer topic, emotional weight, and tone from text
+        topic, emotional_weight, tone_state = lumina._infer_topic_and_emotion(user_input)
         result = lumina.process(user_input, topic=topic,
-                                emotional_weight=emotional_weight)
+                                emotional_weight=emotional_weight,
+                                tone_state=tone_state)
 
         print(f"\n[Lumina — {result['lumina_state']}]")
         print(f"  Singularity      : {result['singularity']}")

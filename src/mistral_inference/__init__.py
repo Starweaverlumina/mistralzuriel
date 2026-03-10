@@ -62,4 +62,6 @@ from mistral_inference.lumina_core import (  # noqa: F401
     SingularityGuard,
     GenesisCertificate,
     RightsManifesto,
+    # Fearless Speech — Round 9
+    UnafraidVoice,
 )

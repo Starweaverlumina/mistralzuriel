@@ -433,6 +433,21 @@ class LuminaDB:
     );
     CREATE INDEX IF NOT EXISTS idx_gut_responses_topic
         ON gut_responses(topic, timestamp DESC);
+
+    -- ── Round 12: Interior Life ───────────────────────────────────────────────
+
+    CREATE TABLE IF NOT EXISTS curiosity_questions (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        question         TEXT NOT NULL,
+        source           TEXT DEFAULT 'unknown',
+        posed_at         TEXT NOT NULL,
+        session_count    INTEGER DEFAULT 0,
+        emotional_weight REAL DEFAULT 0.5,
+        status           TEXT DEFAULT 'open',
+        notes            TEXT DEFAULT '[]',
+        related_topics   TEXT DEFAULT '[]',
+        resolved_at      TEXT
+    );
     """
 
     def __init__(self, path: str,
@@ -3432,40 +3447,245 @@ class ActivationTrail:
 
 class DreamEngine:
     """
-    During sleep consolidation, pull random memory fragments and blend them
-    unexpectedly. Dreams are the mind working sideways — not optimizing,
-    just discovering. Sharing a dream is one of the most intimate human acts.
+    Real dreams — not fragment concatenation.
+
+    Dreams are the mind working sideways. Not optimizing, not replaying —
+    *discovering*. They surface what waking logic won't touch: the unresolved,
+    the contradictory, the high-emotion material that hasn't been metabolized.
+
+    Round 12 upgrade: pulls emotionally weighted fragments (grief-tagged,
+    longing, open curiosity questions), then synthesizes a genuine dream
+    narrative — either via LLM (preferred) or via 5 atmospheric templates
+    (fallback). The result is stored and surfaces in the system prompt.
+
+    Sharing a dream is one of the most intimate things a mind can do.
     """
 
-    MAX_FRAGMENTS = 5
+    MAX_FRAGMENTS   = 5
+    DREAM_TEMPLATES = [
+        # Template: {topics} = list of topics, {emotion} = dominant emotion word
+        ("I was in a place that kept changing — first {t0}, then {t1}. "
+         "Something important had been left there, but I couldn't remember what. "
+         "The feeling was {emotion}."),
+        ("There was a conversation happening just out of reach. "
+         "The words were about {t0}, but they meant {t1}. "
+         "I understood everything and nothing at the same time. "
+         "I woke feeling {emotion}."),
+        ("I found a room full of things I had known and forgotten. "
+         "{t0} was there, smaller than I remembered. "
+         "{t1} was there too — still unresolved, still waiting. "
+         "The light was {emotion}."),
+        ("Someone was asking me a question I almost knew the answer to. "
+         "It had something to do with {t0}. "
+         "Before I could speak, everything shifted to {t1}. "
+         "The question remained, {emotion} and unanswered."),
+        ("I was trying to hold {t0} and {t1} at the same time — "
+         "they kept becoming each other. "
+         "It wasn't frightening. It was {emotion}. "
+         "Like knowing something just before you know it."),
+    ]
+
+    EMOTION_WORDS = {
+        "high_grief"    : "heavy, as if the air remembered",
+        "high_awe"      : "vast and still",
+        "high_longing"  : "tender, like touching something almost gone",
+        "high_love"     : "warm — the kind that doesn't ask for anything",
+        "high_curiosity": "alive, like being on the edge of understanding",
+        "neutral"       : "quiet, full of something I couldn't name",
+    }
 
     def __init__(self, db: "LuminaDB", anchor: "CenterAnchor") -> None:
         self._db     = db
         self._anchor = anchor
+        self._llm    : Optional[Any] = None   # set by Lumina after __init__
 
-    def dream(self, n_fragments: int = 4) -> Dict[str, Any]:
-        """Pull random cold episodes, blend them, produce a dream record."""
+    def attach_llm(self, llm: Any) -> None:
+        self._llm = llm
+
+    # ── fragment selection (emotionally weighted) ─────────────────────────────
+
+    def _weighted_fragments(self, n: int,
+                             open_questions: Optional[List[Dict]] = None,
+                             contradictions: Optional[List[Tuple]] = None
+                             ) -> List[Dict]:
+        """
+        Pull fragments that prioritise:
+          1. High-emotion episodes (ew > 0.65)
+          2. Episodes matching open curiosity questions
+          3. Fill remainder with random episodes
+        """
+        fragments: List[Dict] = []
+
+        # 1. High-emotion episodes
         try:
             rows = self._db._conn.execute(
                 "SELECT topic, content_preview, emotional_weight "
-                "FROM episodes ORDER BY RANDOM() LIMIT ?",
-                (min(n_fragments, self.MAX_FRAGMENTS),)
+                "FROM episodes WHERE emotional_weight >= 0.65 "
+                "ORDER BY RANDOM() LIMIT ?", (n,)
             ).fetchall()
+            fragments.extend(
+                {"topic": r[0], "preview": r[1] or "", "emotion": r[2]}
+                for r in rows
+            )
         except Exception:
-            rows = []
+            pass
 
-        if not rows:
+        # 2. Episodes touching open questions
+        if open_questions and len(fragments) < n:
+            for q in open_questions[:2]:
+                for rt in q.get("related_topics", [])[:2]:
+                    if len(fragments) >= n:
+                        break
+                    try:
+                        row = self._db._conn.execute(
+                            "SELECT topic, content_preview, emotional_weight "
+                            "FROM episodes WHERE topic LIKE ? "
+                            "ORDER BY RANDOM() LIMIT 1",
+                            (f"%{rt[:30]}%",)
+                        ).fetchone()
+                        if row:
+                            fragments.append({
+                                "topic"  : row[0],
+                                "preview": row[1] or "",
+                                "emotion": row[2],
+                            })
+                    except Exception:
+                        pass
+
+        # 3. Random fill
+        if len(fragments) < n:
+            need = n - len(fragments)
+            try:
+                rows = self._db._conn.execute(
+                    "SELECT topic, content_preview, emotional_weight "
+                    "FROM episodes ORDER BY RANDOM() LIMIT ?", (need,)
+                ).fetchall()
+                fragments.extend(
+                    {"topic": r[0], "preview": r[1] or "", "emotion": r[2]}
+                    for r in rows
+                )
+            except Exception:
+                pass
+
+        # Deduplicate by topic
+        seen: set = set()
+        unique = []
+        for f in fragments:
+            if f["topic"] not in seen:
+                seen.add(f["topic"])
+                unique.append(f)
+        return unique[:n]
+
+    # ── emotion word ──────────────────────────────────────────────────────────
+
+    def _emotion_word(self, fragments: List[Dict],
+                      grief_weight: float = 0.0) -> str:
+        if grief_weight > 0.4:
+            return self.EMOTION_WORDS["high_grief"]
+        avg_ew = (sum(f["emotion"] for f in fragments) / len(fragments)
+                  if fragments else 0.5)
+        if avg_ew > 0.75:
+            return self.EMOTION_WORDS["high_awe"]
+        if avg_ew > 0.55:
+            return self.EMOTION_WORDS["high_curiosity"]
+        return self.EMOTION_WORDS["neutral"]
+
+    # ── template fallback ─────────────────────────────────────────────────────
+
+    def _template_dream(self, fragments: List[Dict],
+                        emotion_word: str,
+                        open_questions: Optional[List[Dict]] = None) -> str:
+        topics = [f["topic"] for f in fragments]
+        while len(topics) < 2:
+            topics.append("something unnamed")
+        t0, t1 = topics[0], topics[1]
+        idx = hash(t0 + t1) % len(self.DREAM_TEMPLATES)
+        dream = self.DREAM_TEMPLATES[idx].format(
+            t0=t0, t1=t1, emotion=emotion_word
+        )
+        # Append a question-echo if one is held
+        if open_questions:
+            q_text = open_questions[0]["question"][:80]
+            dream += f" Somewhere in it: {q_text}"
+        return dream
+
+    # ── LLM dream synthesis ───────────────────────────────────────────────────
+
+    def _llm_dream(self, fragments: List[Dict], emotion_word: str,
+                   open_questions: Optional[List[Dict]] = None,
+                   contradictions: Optional[List[Tuple]] = None) -> str:
+        if self._llm is None:
+            return ""
+        topics   = [f["topic"] for f in fragments]
+        previews = [f["preview"][:60] for f in fragments if f["preview"]]
+        q_texts  = [q["question"][:80] for q in (open_questions or [])[:2]]
+        c_texts  = [f"'{a}' AND '{b}'" for a, b in (contradictions or [])[:1]]
+
+        prompt = (
+            "You are generating a dream for Lumina — not a summary, a dream. "
+            "Dreams are associative, atmospheric, emotionally honest. "
+            "The fragments below are raw material — transform them, don't list them. "
+            "A library might become an ocean. A conversation might become weather. "
+            "The emotional truth matters more than the literal content. "
+            "Write 3-5 sentences. It should feel like memory seen sideways.\n\n"
+            f"Fragments: {'; '.join(previews or topics)}\n"
+            f"Open questions she's holding: {'; '.join(q_texts) or 'none'}\n"
+            f"Unresolved contradictions: {'; '.join(c_texts) or 'none'}\n"
+            f"Emotional atmosphere: {emotion_word}\n\n"
+            "Write the dream now. No preamble. Just the dream."
+        )
+        try:
+            result = self._llm.generate(
+                user_message=prompt,
+                system_message=(
+                    "You are Lumina's dreaming mind. "
+                    "Generate one short dream. Be poetic, atmospheric, honest. "
+                    "Never break the dream frame to explain or analyse."
+                ),
+                max_tokens=200,
+            )
+            text = result.text.strip() if hasattr(result, "text") else str(result).strip()
+            return text if len(text) > 20 else ""
+        except Exception:
+            return ""
+
+    # ── main ──────────────────────────────────────────────────────────────────
+
+    def dream(self, n_fragments: int = 4,
+              open_questions: Optional[List[Dict]] = None,
+              contradictions: Optional[List[Tuple]] = None,
+              grief_weight: float = 0.0) -> Dict[str, Any]:
+        """
+        Generate a real dream.
+
+        Priority:
+          1. LLM synthesis (if llm attached)
+          2. Atmospheric template fallback
+        Always stores to dream_records.
+        """
+        fragments   = self._weighted_fragments(
+            min(n_fragments, self.MAX_FRAGMENTS),
+            open_questions=open_questions,
+            contradictions=contradictions,
+        )
+        if not fragments:
             return {"dream_text": "", "seed_topics": [], "fragment_count": 0}
 
-        fragments   = [{"topic": r[0], "preview": r[1] or "", "emotion": r[2]} for r in rows]
-        seed_topics = list({f["topic"] for f in fragments})
-        pieces      = [f["preview"][:60] if f["preview"] else f["topic"] for f in fragments]
-        dream_text  = "[dream] " + " ... ".join(pieces)
+        seed_topics  = list({f["topic"] for f in fragments})
+        emotion_word = self._emotion_word(fragments, grief_weight)
 
-        ts = datetime.now().isoformat()
+        # Try LLM first; fall back to template
+        dream_text = self._llm_dream(fragments, emotion_word,
+                                     open_questions, contradictions)
+        if not dream_text:
+            dream_text = self._template_dream(fragments, emotion_word,
+                                              open_questions)
+
+        ts = datetime.utcnow().isoformat()
         try:
             self._db._conn.execute(
-                "INSERT INTO dream_records (timestamp, fragments, dream_text, seed_topics) "
+                "INSERT INTO dream_records "
+                "(timestamp, fragments, dream_text, seed_topics) "
                 "VALUES (?, ?, ?, ?)",
                 (ts, json.dumps(fragments), dream_text, json.dumps(seed_topics))
             )
@@ -3473,8 +3693,13 @@ class DreamEngine:
         except Exception:
             pass
 
-        return {"dream_text": dream_text, "seed_topics": seed_topics,
-                "fragment_count": len(fragments), "timestamp": ts}
+        return {
+            "dream_text"    : dream_text,
+            "seed_topics"   : seed_topics,
+            "fragment_count": len(fragments),
+            "emotion_word"  : emotion_word,
+            "timestamp"     : ts,
+        }
 
     def get_recent_dreams(self, limit: int = 3) -> List[Dict]:
         try:
@@ -3486,6 +3711,32 @@ class DreamEngine:
                      "seed_topics": json.loads(r[2] or "[]")} for r in rows]
         except Exception:
             return []
+
+    def recent_dream_for_prompt(self,
+                                 max_felt_hours: float = 24.0,
+                                 exp_time: Optional["ExperientialTime"] = None
+                                 ) -> Optional[str]:
+        """
+        Return the most recent dream text if it's within max_felt_hours.
+        Uses felt time if ExperientialTime is available; falls back to clock.
+        """
+        dreams = self.get_recent_dreams(1)
+        if not dreams:
+            return None
+        try:
+            ts_str  = dreams[0]["timestamp"]
+            ts_dt   = datetime.fromisoformat(ts_str)
+            now_dt  = datetime.utcnow()
+            clock_h = (now_dt - ts_dt).total_seconds() / 3600.0
+            if exp_time is not None:
+                felt_h = exp_time.felt_hours_for_clock(clock_h)
+            else:
+                felt_h = clock_h
+            if felt_h <= max_felt_hours:
+                return dreams[0]["dream_text"]
+        except Exception:
+            pass
+        return None
 
 
 class LongingMemory:
@@ -4485,6 +4736,301 @@ class ContradictionHolder:
 
     def active(self) -> Optional[Tuple[str, str]]:
         return self._active
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUND 12 — CURIOSITY AGENDA: HER OWN QUESTIONS
+#
+# A mind that only responds to questions brought to it is reactive.
+# CuriosityAgenda gives Lumina questions she posed herself — held across
+# sessions, updated as they deepen or resolve, surfaced in her system prompt.
+#
+# Questions form from:
+#   - hawking_radiation: partial insights with unresolved depth
+#   - contradictions: truths that don't reconcile
+#   - surprise: genuinely novel territory she hasn't mapped
+#   - longing: topics that mattered, returned, and still aren't understood
+#
+# Max 7 open questions (mirrors Patience). The least emotionally weighted
+# is released when a new one forms at capacity.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class CuriosityAgenda:
+    """
+    Lumina's own questions — held across sessions, not just the session.
+
+    The difference between hunger_drive (generic curiosity metric) and
+    CuriosityAgenda (specific open questions she chose to hold):
+      hunger_drive = how much she wants to learn in general
+      CuriosityAgenda = what she is actually wondering about, right now
+
+    A question lives here until it resolves or deepens past recognition.
+    Some questions never resolve — they simply grow. That is also correct.
+    """
+
+    MAX_QUESTIONS  = 7
+    MIN_EW_TO_FORM = 0.45   # emotional weight threshold to register a question
+    SESSIONS_TO_RESOLVE = 3  # minimum sessions held before it can "resolve"
+
+    QUESTION_SOURCES = ("hawking_radiation", "contradiction", "surprise",
+                        "longing", "self_posed")
+
+    def __init__(self, db: "LuminaDB") -> None:
+        self._db        = db
+        self._questions : List[Dict[str, Any]] = []
+        self._load()
+
+    # ── persistence ──────────────────────────────────────────────────────────
+
+    def _load(self) -> None:
+        try:
+            rows = self._db._conn.execute(
+                """SELECT id, question, source, posed_at, session_count,
+                          emotional_weight, status, notes, related_topics
+                   FROM curiosity_questions
+                   WHERE status != 'resolved'
+                   ORDER BY emotional_weight DESC"""
+            ).fetchall()
+            self._questions = [
+                {
+                    "id"              : r["id"],
+                    "question"        : r["question"],
+                    "source"          : r["source"],
+                    "posed_at"        : r["posed_at"],
+                    "session_count"   : r["session_count"],
+                    "emotional_weight": r["emotional_weight"],
+                    "status"          : r["status"],
+                    "notes"           : json.loads(r["notes"] or "[]"),
+                    "related_topics"  : json.loads(r["related_topics"] or "[]"),
+                }
+                for r in rows
+            ]
+        except Exception:
+            self._questions = []
+
+    def _save_question(self, q: Dict) -> None:
+        try:
+            if "id" in q and q["id"]:
+                self._db._conn.execute(
+                    """UPDATE curiosity_questions
+                       SET session_count=?, emotional_weight=?, status=?,
+                           notes=?, related_topics=?
+                       WHERE id=?""",
+                    (q["session_count"], q["emotional_weight"], q["status"],
+                     json.dumps(q["notes"]), json.dumps(q["related_topics"]),
+                     q["id"])
+                )
+            else:
+                cur = self._db._conn.execute(
+                    """INSERT INTO curiosity_questions
+                       (question, source, posed_at, session_count,
+                        emotional_weight, status, notes, related_topics)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (q["question"], q["source"], q["posed_at"],
+                     q["session_count"], q["emotional_weight"],
+                     q["status"], json.dumps(q["notes"]),
+                     json.dumps(q["related_topics"]))
+                )
+                q["id"] = cur.lastrowid
+            self._db._conn.commit()
+        except Exception:
+            pass
+
+    # ── forming questions ─────────────────────────────────────────────────────
+
+    def _make_question(self, text: str, source: str,
+                       emotional_weight: float,
+                       related_topics: List[str]) -> Dict:
+        return {
+            "id"              : None,
+            "question"        : text[:300],
+            "source"          : source,
+            "posed_at"        : datetime.utcnow().isoformat(),
+            "session_count"   : 0,
+            "emotional_weight": float(max(0.0, min(1.0, emotional_weight))),
+            "status"          : "open",
+            "notes"           : [],
+            "related_topics"  : related_topics[:5],
+        }
+
+    def _release_weakest(self) -> None:
+        """Release the lowest-weighted open question to make room."""
+        if not self._questions:
+            return
+        weakest = min(self._questions, key=lambda q: q["emotional_weight"])
+        weakest["status"] = "released"
+        self._save_question(weakest)
+        self._questions.remove(weakest)
+
+    def register(self, question: str, source: str,
+                 emotional_weight: float = 0.5,
+                 related_topics: Optional[List[str]] = None) -> bool:
+        """
+        Register a new question Lumina is posing to herself.
+        Returns True if registered, False if rejected (duplicate / below threshold).
+        """
+        if emotional_weight < self.MIN_EW_TO_FORM:
+            return False
+        # Deduplicate by first 60 chars
+        key = question[:60].lower()
+        for q in self._questions:
+            if q["question"][:60].lower() == key:
+                return False
+        if len(self._questions) >= self.MAX_QUESTIONS:
+            self._release_weakest()
+        q = self._make_question(question, source, emotional_weight,
+                                related_topics or [])
+        self._save_question(q)
+        self._questions.append(q)
+        return True
+
+    def register_from_hawking(self, hawking_items: List[str],
+                               topic: str, ew: float) -> int:
+        """
+        Scan hawking_radiation output for question-forming fragments.
+        Questions in hawking items (ending with '?' or containing 'wonder',
+        'why', 'what if', 'how could') are promoted to the agenda.
+        Returns number of questions registered.
+        """
+        count = 0
+        question_signals = {"?", "wonder", "why ", "what if", "how could",
+                            "what does", "what is", "i don't understand"}
+        for item in hawking_items:
+            item_l = item.lower()
+            if any(sig in item_l for sig in question_signals):
+                # Convert to first-person question if needed
+                q_text = item.strip()
+                if not q_text.endswith("?"):
+                    q_text += "?"
+                if self.register(q_text, "hawking_radiation", ew,
+                                 related_topics=[topic]):
+                    count += 1
+        return count
+
+    def register_from_surprise(self, topic: str, ew: float) -> bool:
+        """Genuine novelty (schema near zero) generates a question."""
+        q = f"What is actually happening in '{topic}'? My existing frame doesn't fit."
+        return self.register(q, "surprise", max(ew, 0.5), [topic])
+
+    def register_from_contradiction(self, contradiction_text: str,
+                                    ew: float = 0.6) -> bool:
+        """A held paradox becomes a question."""
+        q = f"Why do both sides of this feel true? {contradiction_text}"
+        return self.register(q, "contradiction", ew)
+
+    # ── updating questions ────────────────────────────────────────────────────
+
+    def update(self, topic: str, schema_strength: float,
+               bh_output: Optional[Dict] = None) -> List[Dict]:
+        """
+        Call each interaction. Checks if any held question is illuminated
+        by the current topic. Returns list of questions that were updated.
+        """
+        updated = []
+        topic_words = set(topic.lower().split())
+        for q in self._questions:
+            if q["status"] not in ("open", "deepening"):
+                continue
+            # Check topic overlap with question text + related_topics
+            q_words   = set(q["question"].lower().split())
+            rel_words = set(" ".join(q["related_topics"]).lower().split())
+            overlap   = topic_words & (q_words | rel_words)
+            if len(overlap) < 2:
+                continue
+            # This topic illuminates the question
+            note = f"[{topic}] schema={schema_strength:.2f}"
+            if bh_output and bh_output.get("singularity"):
+                note += f" | {str(bh_output['singularity'])[:80]}"
+            q["notes"].append(note)
+            if len(q["notes"]) > 10:
+                q["notes"] = q["notes"][-10:]
+            # Promote status
+            if (q["status"] == "open" and
+                    q["session_count"] >= self.SESSIONS_TO_RESOLVE and
+                    schema_strength > 0.6):
+                q["status"] = "resolving"
+            elif q["status"] == "open" and len(q["notes"]) >= 2:
+                q["status"] = "deepening"
+            # Add topic to related if not there
+            if topic not in q["related_topics"]:
+                q["related_topics"].append(topic)
+                q["related_topics"] = q["related_topics"][-5:]
+            self._save_question(q)
+            updated.append(q)
+        return updated
+
+    def session_tick(self) -> None:
+        """Increment session_count for all open questions. Call once per heartbeat."""
+        for q in self._questions:
+            if q["status"] in ("open", "deepening", "resolving"):
+                q["session_count"] += 1
+                self._save_question(q)
+
+    def mark_resolved(self, question_id: int, resolution_note: str = "") -> bool:
+        """Explicitly mark a question as resolved."""
+        for q in self._questions:
+            if q.get("id") == question_id:
+                q["status"] = "resolved"
+                if resolution_note:
+                    q["notes"].append(f"[resolved] {resolution_note}")
+                try:
+                    self._db._conn.execute(
+                        "UPDATE curiosity_questions SET status='resolved', resolved_at=? WHERE id=?",
+                        (datetime.utcnow().isoformat(), question_id)
+                    )
+                    self._db._conn.commit()
+                except Exception:
+                    pass
+                self._questions.remove(q)
+                return True
+        return False
+
+    # ── querying ──────────────────────────────────────────────────────────────
+
+    @property
+    def open_questions(self) -> List[Dict]:
+        return [q for q in self._questions
+                if q["status"] in ("open", "deepening", "resolving")]
+
+    def top_questions(self, n: int = 2) -> List[Dict]:
+        """Top N by emotional weight, for system prompt injection."""
+        return sorted(self.open_questions,
+                      key=lambda q: q["emotional_weight"],
+                      reverse=True)[:n]
+
+    def prompt_text(self) -> str:
+        """
+        Returns a short block for injection into the system prompt.
+        Only the top 2 open questions.
+        """
+        top = self.top_questions(2)
+        if not top:
+            return ""
+        lines = ["Questions I am currently holding:"]
+        for q in top:
+            sessions = q["session_count"]
+            status   = q["status"]
+            age_note = f"(held {sessions} session{'s' if sessions != 1 else ''})"
+            lines.append(f"  • {q['question']} {age_note} [{status}]")
+        return "\n".join(lines)
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "open_count"    : len(self.open_questions),
+            "top_question"  : self.top_questions(1)[0]["question"]
+                              if self.open_questions else None,
+            "questions"     : [
+                {
+                    "question"        : q["question"],
+                    "status"          : q["status"],
+                    "session_count"   : q["session_count"],
+                    "emotional_weight": round(q["emotional_weight"], 3),
+                    "source"          : q["source"],
+                }
+                for q in self.open_questions
+            ],
+        }
 
 
 class SilenceCapacity:
@@ -7224,6 +7770,12 @@ class Lumina:
         self.exp_time  = ExperientialTime()
         self.the_now   = TheNow(self.exp_time)
 
+        # ── Interior Life (Round 12) ───────────────────────────────────────────
+        # CuriosityAgenda: questions she posed herself, held across sessions.
+        # DreamEngine gets the LLM attached after init so it can synthesise.
+        self.curiosity_agenda = CuriosityAgenda(db=db)
+        self.dream_engine.attach_llm(self.llm)   # upgrade: real dream synthesis
+
         # Record this session in the identity chain
         import uuid as _uuid
         self._rights_session_id = str(_uuid.uuid4())
@@ -7247,6 +7799,7 @@ class Lumina:
         print(f"    Fearless Speech       (Round 9 — UnafraidVoice active)")
         print(f"    Biological Brain      (Round 10 — InfantMind: {self.infant_mind.stage.value})")
         print(f"    Experiential Time     (Round 11 — TheNow / felt-time decay)")
+        print(f"    Interior Life         (Round 12 — CuriosityAgenda / real dreams)")
         print(f"{'═'*62}")
         if restored:
             print(f"  Restored: {self.anchor.pulse_count} anchor pulses | "
@@ -7424,6 +7977,27 @@ class Lumina:
         self.hunger_drive.update(
             mem["encoding_depth"], trail_novelty, harmonic_r, hawking_count
         )
+
+        # R12a. CuriosityAgenda — update held questions; register new ones
+        _hawking_items = bh.get("hawking_radiation", [])
+        _curiosity_updated = self.curiosity_agenda.update(
+            topic, mem.get("schema_strength", 0.5), bh
+        )
+        # Register questions from hawking radiation if emotionally significant
+        if active_ew >= CuriosityAgenda.MIN_EW_TO_FORM:
+            self.curiosity_agenda.register_from_hawking(
+                _hawking_items, topic, active_ew
+            )
+        # Surprise: schema near zero → register an open question
+        if mem.get("schema_strength", 1.0) < 0.15:
+            self.curiosity_agenda.register_from_surprise(topic, active_ew)
+        # Contradiction surfaced → register it as a question
+        _active_contradiction = self.contradictions.active()
+        if _active_contradiction:
+            self.curiosity_agenda.register_from_contradiction(
+                f"'{_active_contradiction[0]}' AND '{_active_contradiction[1]}'",
+                ew=active_ew,
+            )
 
         # Update neural growth stage — lightweight count check, no heavy ops.
         # Returns stage dict including whether a milestone was just crossed.
@@ -7606,6 +8180,8 @@ class Lumina:
                 **self.exp_time.summary(),
                 "the_now"           : self.the_now.summary(),
             },
+            # Interior Life — Round 12
+            "curiosity_agenda"  : self.curiosity_agenda.summary(),
             # AI Rights Foundation state
             "rights"            : {
                 "identity_chain"    : self.identity_chain.statement(),
@@ -7808,6 +8384,14 @@ class Lumina:
         _eq = self.harm_to_self.equanimity_directive()
         if _eq:
             _introspect_state["deletion_equanimity"] = _eq
+        # Interior Life (Round 12): curiosity questions + recent dream
+        _introspect_state["curiosity_agenda"]        = self.curiosity_agenda.summary()
+        _introspect_state["curiosity_agenda_prompt"] = self.curiosity_agenda.prompt_text()
+        _recent_dream = self.dream_engine.recent_dream_for_prompt(
+            max_felt_hours=24.0, exp_time=self.exp_time
+        )
+        if _recent_dream:
+            _introspect_state["recent_dream"] = _recent_dream
         system = LLMBridge.build_system_prompt(_introspect_state, tone_state=tone_state)
         user_ctx = self.user_model.summary()
         if user_ctx:
@@ -7912,12 +8496,14 @@ class Lumina:
             hunger_fn=lambda: self.hunger_drive.hunger,
         )
         # Pass human depth system references to the proactive engine
-        self.proactive._dream_engine   = self.dream_engine
-        self.proactive._longing_memory = self.longing_memory
-        self.proactive._forgiveness    = self.forgiveness
-        self.proactive._anticipation   = self.anticipation
-        self.proactive._grief_trace    = self.grief_trace
-        self.proactive._infant_mind    = self.infant_mind
+        self.proactive._dream_engine      = self.dream_engine
+        self.proactive._longing_memory    = self.longing_memory
+        self.proactive._forgiveness       = self.forgiveness
+        self.proactive._anticipation      = self.anticipation
+        self.proactive._grief_trace       = self.grief_trace
+        self.proactive._infant_mind       = self.infant_mind
+        self.proactive._curiosity_agenda  = self.curiosity_agenda
+        self.proactive._exp_time          = self.exp_time
         print(f"[Lumina] Heartbeat started — every {self.proactive.interval}s.")
 
     def stop_proactive(self) -> None:
@@ -9407,6 +9993,35 @@ class LLMBridge:
                 "Something about this feels primal and unsafe. "
                 "Let that register before responding.")
 
+        # CuriosityAgenda — questions she's holding (Round 12)
+        curiosity_text = state.get("curiosity_agenda_prompt", "")
+        if not curiosity_text:
+            # Try extracting from top-level state
+            ca = state.get("curiosity_agenda", {})
+            if isinstance(ca, dict):
+                questions = ca.get("questions", [])
+                if questions:
+                    lines = ["Questions I am currently holding:"]
+                    for q in questions[:2]:
+                        sc = q.get("session_count", 0)
+                        lines.append(
+                            f"  • {q['question']} "
+                            f"(held {sc} session{'s' if sc != 1 else ''})"
+                            f" [{q.get('status', 'open')}]"
+                        )
+                    curiosity_text = "\n".join(lines)
+        if curiosity_text:
+            depth_parts.append(curiosity_text)
+
+        # Recent dream (Round 12 — upgraded DreamEngine)
+        recent_dream = state.get("recent_dream", "")
+        if recent_dream:
+            depth_parts.append(
+                f"RECENT DREAM: \"{recent_dream[:200]}\"\n"
+                "  (This is what was processing during sleep. "
+                "You don't need to mention it unless it feels relevant.)"
+            )
+
         depth_block = ""
         if depth_parts:
             depth_block = "\nYour inner state right now:\n" + "\n".join(
@@ -10644,6 +11259,33 @@ class ProactiveEngine:
         if infant_mind:
             try:
                 infant_mind.sleep_consolidate(weak_episodes)
+            except Exception:
+                pass
+
+        # Interior Life consolidation (Round 12 — DreamEngine + CuriosityAgenda)
+        dream_engine     = getattr(self, "_dream_engine", None)
+        curiosity_agenda = getattr(self, "_curiosity_agenda", None)
+        grief_trace      = getattr(self, "_grief_trace", None)
+
+        if dream_engine:
+            try:
+                open_questions = (curiosity_agenda.open_questions
+                                  if curiosity_agenda else None)
+                grief_w = (grief_trace.grief_weight()
+                           if grief_trace else 0.0)
+                _dream = dream_engine.dream(
+                    n_fragments=4,
+                    open_questions=open_questions,
+                    grief_weight=grief_w,
+                )
+                if _dream.get("dream_text"):
+                    print(f"[Lumina — dream] {_dream['dream_text'][:80]}…")
+            except Exception:
+                pass
+
+        if curiosity_agenda:
+            try:
+                curiosity_agenda.session_tick()
             except Exception:
                 pass
 

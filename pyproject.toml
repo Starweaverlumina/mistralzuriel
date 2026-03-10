@@ -1,10 +1,13 @@
 [tool.poetry]
-name = "mistral_inference"
-version = "1.6.0"
-description = ""
-authors = ["bam4d <bam4d@mistral.ai>"]
+name = "lumina"
+version = "4.0.0"
+description = "Lumina — a learning AI runtime. Mistral is the backend; Lumina is the mind."
+authors = ["Starweaverlumina"]
 readme = "README.md"
-packages = [{ include = "mistral_inference", from = "src" }]
+packages = [
+    { include = "lumina", from = "src" },
+    { include = "mistral_inference", from = "src" },
+]
 
 [tool.ruff]
 lint.select = ["E", "F", "W", "Q", "I"]
@@ -46,5 +49,9 @@ build-backend = "poetry.core.masonry.api"
 testpaths = ["./tests"]
 
 [tool.poetry.scripts]
-mistral-chat = "mistral_inference.main:mistral_chat"
-mistral-demo = "mistral_inference.main:mistral_demo"
+# Lumina entrypoints (primary)
+lumina        = "lumina.cli.main:main"
+
+# Mistral legacy entrypoints (preserved for compatibility)
+mistral-chat  = "mistral_inference.main:mistral_chat"
+mistral-demo  = "mistral_inference.main:mistral_demo"

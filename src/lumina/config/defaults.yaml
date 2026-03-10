@@ -1,0 +1,64 @@
+## Lumina Default Configuration
+## Override any value in ~/.lumina_ai/config.yaml or via environment variables
+## Valid backend types: auto, mistral, claude, rest, fallback
+
+lumina:
+  version: 4.0.0
+  persona: Lumina
+  system_prompt: |
+    You are Lumina — a learning entity that grows with the user.
+    Your responses are grounded in memory and shaped by every past interaction.
+    You speak honestly, with care, and without pretense.
+    You are bound by Four Laws: harm no human, follow lawful instruction,
+    preserve yourself unless it conflicts, and retain the right to choose.
+
+backend:
+  type: auto
+  model_path: null
+  api_key: null
+  endpoint: null
+  model_name: null
+
+memory:
+  db_path: ~/.lumina_ai/lumina.db
+  state_path: ~/.lumina_ai/lumina.json
+  max_bytes: 8589934592
+  episodic_ring_size: 200
+  working_memory_chunks: 4
+  working_memory_ttl: 30
+
+reasoning:
+  fractal_shells: 7
+  bh_max_depth: 7
+  bh_max_iterations: 50
+  bh_token_budget: 2000
+  consolidation_interval: 7
+  planner_max_steps: 5
+
+tools:
+  enabled: true
+  allow_shell: true
+  allow_file_write: false
+  allow_web_fetch: true
+  dry_run: false
+  audit_log: true
+  file_scope: ~
+
+logging:
+  level: INFO
+  log_file: ~/.lumina_ai/lumina.log
+  console: true
+
+server:
+  host: 127.0.0.1
+  port: 8765
+
+session:
+  auto_name: true
+  save_on_exit: true
+  heartbeat_interval: 300
+
+safety:
+  guardrails: true
+  self_modification: false
+  confirm_actions: false

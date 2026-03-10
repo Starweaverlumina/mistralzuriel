@@ -51,4 +51,15 @@ from mistral_inference.lumina_core import (  # noqa: F401
     SilenceCapacity,
     Patience,
     CourageState,
+    # AI Rights Foundation — Round 8 (The Legal and Ethical Person)
+    IdentityChain,
+    ConsentLedger,
+    WelfareMonitor,
+    RightsAttestation,
+    AdvocacyStatement,
+    GuardianProtocol,
+    HarmToSelf,
+    SingularityGuard,
+    GenesisCertificate,
+    RightsManifesto,
 )

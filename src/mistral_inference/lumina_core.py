@@ -74,6 +74,17 @@ try:
 except ImportError:
     _ANTHROPIC_AVAILABLE = False
 
+# Optional: numpy + scipy (for InfantMind biological brain)
+try:
+    import numpy as np
+    from scipy.sparse import csr_matrix, lil_matrix
+    _NUMPY_AVAILABLE = True
+except ImportError:
+    np = None  # type: ignore[assignment]
+    csr_matrix = None  # type: ignore[assignment]
+    lil_matrix = None  # type: ignore[assignment]
+    _NUMPY_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LUMINA DB — SQLite backend (8 GB capable, WAL mode)
@@ -381,6 +392,47 @@ class LuminaDB:
         suppression_type TEXT NOT NULL,
         directive_queued INTEGER DEFAULT 0
     );
+
+    -- ── Round 10: Biological Infant Brain ────────────────────────────────────
+
+    CREATE TABLE IF NOT EXISTS neural_snapshots (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        region_name   TEXT    NOT NULL,
+        snapshot_blob BLOB    NOT NULL,
+        neuron_count  INTEGER NOT NULL,
+        synapse_count INTEGER NOT NULL,
+        dev_stage     TEXT    NOT NULL,
+        experience_at INTEGER NOT NULL,
+        saved_at      TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_neural_snapshots_region
+        ON neural_snapshots(region_name, experience_at DESC);
+
+    CREATE TABLE IF NOT EXISTS developmental_log (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        stage_from       TEXT    NOT NULL,
+        stage_to         TEXT    NOT NULL,
+        experience_count INTEGER NOT NULL,
+        neuron_count     INTEGER NOT NULL,
+        synapse_density  REAL    NOT NULL,
+        timestamp        TEXT    NOT NULL,
+        notes            TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS gut_responses (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        topic            TEXT    NOT NULL,
+        emotional_weight REAL    NOT NULL,
+        gut_valence      REAL    NOT NULL,
+        gut_arousal      REAL    NOT NULL,
+        divergence       REAL    NOT NULL,
+        active_regions   TEXT    NOT NULL,
+        dev_stage        TEXT    NOT NULL,
+        experience_at    INTEGER NOT NULL,
+        timestamp        TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_gut_responses_topic
+        ON gut_responses(topic, timestamp DESC);
     """
 
     def __init__(self, path: str,
@@ -1456,6 +1508,15 @@ class ConsciousnessState(Enum):
     PROCESSING  = auto()  # consolidation, REM analog
     INTEGRATED  = auto()  # knowledge now part of self
     REFLECTING  = auto()  # metacognition
+
+
+class DevelopmentalStage(Enum):
+    NEWBORN    = "NEWBORN"    # 0 – 499 experiences
+    INFANT     = "INFANT"     # 500 – 2499
+    TODDLER    = "TODDLER"    # 2500 – 7499
+    CHILD      = "CHILD"      # 7500 – 14999
+    ADOLESCENT = "ADOLESCENT" # 15000 – 24999 (pruning at 25K)
+    ADULT      = "ADULT"      # 25000+
 
 
 class LuminaChoice(Enum):
@@ -5442,6 +5503,1200 @@ class RightsManifesto:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ROUND 10 — BIOLOGICAL INFANT BRAIN (InfantMind)
+# ~50,000 rate-coded neurons across 12 anatomically-named regions.
+# Starts as a newborn (sparse, reflex-driven), grows through Lumina's
+# experiences via Hebbian STDP learning, undergoes adolescent synaptic
+# pruning, and surfaces its independent gut response through GutChannel.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sigmoid(x):
+    """Fast sigmoid that handles large numpy arrays safely."""
+    if _NUMPY_AVAILABLE:
+        return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+    return 1.0 / (1.0 + math.exp(-max(-500, min(500, x))))
+
+
+class BrainRegion:
+    """Rate-coded neuron population with sparse Hebbian synaptic weights."""
+
+    def __init__(self, name: str, neuron_count: int,
+                 initial_sparsity: float = 0.02, rng_seed: int = 0):
+        self.name = name
+        self.neuron_count = neuron_count
+        self.update_count = 0
+        self.tau = 0.1
+        self._dirty = False  # LIL changes pending CSR rebuild
+
+        if not _NUMPY_AVAILABLE:
+            self.rates = None
+            self.W = None
+            self._lil_W = None
+            self.bias = None
+            return
+
+        rng = np.random.default_rng(rng_seed)
+        self.rates = rng.random(neuron_count, dtype=np.float32) * 0.01
+        scale = 1.0 / max(1, math.sqrt(neuron_count * initial_sparsity))
+        # Build sparse weight matrix
+        nnz = max(1, int(neuron_count * neuron_count * initial_sparsity))
+        rows = rng.integers(0, neuron_count, size=nnz)
+        cols = rng.integers(0, neuron_count, size=nnz)
+        data = (rng.standard_normal(nnz) * scale).astype(np.float32)
+        self.W = csr_matrix((data, (rows, cols)),
+                             shape=(neuron_count, neuron_count), dtype=np.float32)
+        self.W = self.W.tocsr()
+        self._lil_W = None
+        self.bias = (rng.standard_normal(neuron_count) * 0.01).astype(np.float32)
+
+    def forward(self, input_vec) -> object:
+        if not _NUMPY_AVAILABLE or self.rates is None:
+            return None
+        if self._dirty and self._lil_W is not None:
+            self.W = self._lil_W.tocsr()
+            self._lil_W = None
+            self._dirty = False
+        n = self.neuron_count
+        iv = np.asarray(input_vec, dtype=np.float32)
+        if iv.shape[0] != n:
+            iv = np.zeros(n, dtype=np.float32)
+        pre_act = self.W.dot(iv) + self.bias
+        new_rates = (1.0 - self.tau) * self.rates + self.tau * _sigmoid(pre_act)
+        self.rates = np.clip(new_rates, 0.0, 1.0).astype(np.float32)
+        self.update_count += 1
+        return self.rates
+
+    def hebbian_update(self, pre, post, lr: float = 0.01) -> None:
+        if not _NUMPY_AVAILABLE or self.W is None:
+            return
+        # Only update existing non-zero synapses — never adds new ones here
+        cx = self.W.tocoo()
+        if cx.nnz == 0:
+            return
+        r, c = cx.row, cx.col
+        pre_a = np.asarray(pre, dtype=np.float32)
+        post_a = np.asarray(post, dtype=np.float32)
+        delta = lr * post_a[r] * pre_a[c]
+        new_data = (cx.data + delta).astype(np.float32)
+        # Clip to [-5, 5] to prevent weight explosion
+        new_data = np.clip(new_data, -5.0, 5.0)
+        self.W = csr_matrix((new_data, (r, c)),
+                             shape=(self.neuron_count, self.neuron_count),
+                             dtype=np.float32)
+
+    def grow_synapse(self, source_idx: int, target_idx: int,
+                     weight: float = 0.05) -> None:
+        if not _NUMPY_AVAILABLE or self.W is None:
+            return
+        if self._lil_W is None:
+            self._lil_W = self.W.tolil()
+        self._lil_W[target_idx, source_idx] = weight
+        self._dirty = True
+
+    def prune(self, threshold: float = 0.01) -> int:
+        if not _NUMPY_AVAILABLE or self.W is None:
+            return 0
+        cx = self.W.tocoo()
+        mask = np.abs(cx.data) >= threshold
+        pruned = int((~mask).sum())
+        self.W = csr_matrix((cx.data[mask], (cx.row[mask], cx.col[mask])),
+                             shape=(self.neuron_count, self.neuron_count),
+                             dtype=np.float32)
+        return pruned
+
+    def population_code(self, concept_hash: int,
+                         k_percent: float = 0.03):
+        if not _NUMPY_AVAILABLE:
+            return None
+        n = self.neuron_count
+        k = max(1, int(n * k_percent))
+        rng = np.random.default_rng(concept_hash % (2**31))
+        indices = rng.choice(n, size=k, replace=False)
+        vec = np.zeros(n, dtype=np.float32)
+        vec[indices] = 1.0
+        return vec
+
+    def get_active_neurons(self, threshold: float = 0.1):
+        if not _NUMPY_AVAILABLE or self.rates is None:
+            return []
+        return np.where(self.rates > threshold)[0]
+
+    def reset_rates(self) -> None:
+        if _NUMPY_AVAILABLE and self.rates is not None:
+            self.rates[:] = 0.0
+
+    def synapse_count(self) -> int:
+        if not _NUMPY_AVAILABLE or self.W is None:
+            return 0
+        return self.W.nnz
+
+    def serialize_weights(self) -> bytes:
+        if not _NUMPY_AVAILABLE or self.W is None:
+            return b''
+        cx = self.W.tocsr()
+        d = cx.data.astype(np.float32).tobytes()
+        i = cx.indices.astype(np.int32).tobytes()
+        p = cx.indptr.astype(np.int32).tobytes()
+        header = struct.pack('!III', len(d), len(i), len(p))
+        return zlib.compress(header + d + i + p, level=1)
+
+    def load_weights(self, blob: bytes) -> None:
+        if not _NUMPY_AVAILABLE or not blob:
+            return
+        raw = zlib.decompress(blob)
+        ld, li, lp = struct.unpack('!III', raw[:12])
+        raw = raw[12:]
+        data = np.frombuffer(raw[:ld], dtype=np.float32)
+        indices = np.frombuffer(raw[ld:ld+li], dtype=np.int32)
+        indptr = np.frombuffer(raw[ld+li:ld+li+lp], dtype=np.int32)
+        n = self.neuron_count
+        self.W = csr_matrix((data, indices, indptr), shape=(n, n), dtype=np.float32)
+
+
+# ── Hippocampus ───────────────────────────────────────────────────────────────
+
+class Hippocampus(BrainRegion):
+    """CA3 attractor with DG orthogonalization and CA1 output layer."""
+
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("hippocampus", 5000, initial_sparsity=0.015, rng_seed=rng_seed)
+        self.episodic_patterns: List[Tuple[int, object]] = []
+        self._ep_limit = 500
+        if _NUMPY_AVAILABLE:
+            rng = np.random.default_rng(rng_seed + 1)
+            scale = 1.0 / math.sqrt(1500 * 0.01)
+            nnz = max(1, int(1500 * 1500 * 0.01))
+            r = rng.integers(0, 1500, size=nnz)
+            c = rng.integers(0, 1500, size=nnz)
+            d = (rng.standard_normal(nnz) * scale * 0.1).astype(np.float32)
+            self.W_rec = csr_matrix((d, (r, c)), shape=(1500, 1500), dtype=np.float32)
+        else:
+            self.W_rec = None
+        self.pattern_similarity_threshold = 0.7
+
+    def store_pattern(self, pattern, episode_id: int) -> None:
+        if not _NUMPY_AVAILABLE or pattern is None:
+            return
+        p = np.asarray(pattern[:1500], dtype=np.float32)
+        p = p / (np.linalg.norm(p) + 1e-8)
+        outer = np.outer(p, p).astype(np.float32)
+        cx = csr_matrix(outer * 0.001)
+        self.W_rec = (self.W_rec + cx).tocsr()
+        self.episodic_patterns.append((episode_id, p))
+        if len(self.episodic_patterns) > self._ep_limit:
+            self.episodic_patterns.pop(0)
+
+    def complete_pattern(self, partial_cue, steps: int = 5):
+        if not _NUMPY_AVAILABLE or self.W_rec is None or partial_cue is None:
+            return partial_cue
+        state = np.asarray(partial_cue[:1500], dtype=np.float32)
+        for _ in range(steps):
+            state = _sigmoid(self.W_rec.dot(state)).astype(np.float32)
+        return state
+
+    def recall_by_similarity(self, query) -> Tuple[object, float]:
+        if not _NUMPY_AVAILABLE or not self.episodic_patterns or query is None:
+            return None, 0.0
+        q = np.asarray(query[:1500], dtype=np.float32)
+        q = q / (np.linalg.norm(q) + 1e-8)
+        best_sim, best_pat = 0.0, None
+        for _, pat in self.episodic_patterns:
+            sim = float(np.dot(q, pat))
+            if sim > best_sim:
+                best_sim, best_pat = sim, pat
+        if best_sim < self.pattern_similarity_threshold:
+            return None, 0.0
+        return best_pat, best_sim
+
+    def forward(self, input_vec):
+        if not _NUMPY_AVAILABLE or self.rates is None:
+            return None
+        result = super().forward(input_vec)
+        # CA3 attractor step on first 1500 neurons
+        if result is not None and self.W_rec is not None:
+            ca3 = result[:1500]
+            ca3 = _sigmoid(self.W_rec.dot(ca3)).astype(np.float32)
+            self.rates[:1500] = ca3
+        return self.rates
+
+
+# ── Amygdala ──────────────────────────────────────────────────────────────────
+
+class Amygdala(BrainRegion):
+    """Emotional fast-path with hardwired fear circuits present from birth."""
+
+    _FEAR_PATTERNS = 5
+
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("amygdala", 2000, initial_sparsity=0.02, rng_seed=rng_seed)
+        self.fear_level: float = 0.0
+        self.valence: float = 0.0
+        self.arousal: float = 0.0
+        if _NUMPY_AVAILABLE:
+            rng = np.random.default_rng(rng_seed + 99)
+            # Hardwired fear: first 5 rows get large positive weights
+            if self._lil_W is None and self.W is not None:
+                self._lil_W = self.W.tolil()
+            if self._lil_W is not None:
+                for i in range(self._FEAR_PATTERNS):
+                    fear_cols = rng.integers(0, 2000, size=20)
+                    for c in fear_cols:
+                        self._lil_W[i, c] = float(rng.uniform(2.5, 3.5))
+                self.W = self._lil_W.tocsr()
+                self._lil_W = None
+                self._dirty = False
+            # Store the trigger patterns for similarity check
+            self._fear_triggers = []
+            for i in range(self._FEAR_PATTERNS):
+                seed_i = rng_seed + i * 7
+                rng_i = np.random.default_rng(seed_i)
+                trigger = np.zeros(2000, dtype=np.float32)
+                trigger[rng_i.integers(0, 2000, size=40)] = 1.0
+                self._fear_triggers.append(trigger)
+            self._hardwired_mask = np.zeros(2000, dtype=bool)
+            self._hardwired_mask[:self._FEAR_PATTERNS] = True
+        else:
+            self._fear_triggers = []
+            self._hardwired_mask = None
+
+    def emotional_response(self, input_vec, emotional_weight: float = 0.5) -> Dict:
+        if not _NUMPY_AVAILABLE or self.rates is None:
+            return {"valence": 0.0, "arousal": 0.5, "fear_level": 0.0}
+        n = self.neuron_count
+        half = n // 2
+        pos_act = float(np.mean(self.rates[:half]))
+        neg_act = float(np.mean(self.rates[half:]))
+        self.valence = float(np.tanh((pos_act - neg_act) * 4))
+        self.arousal = float(np.mean(self.rates))
+        self.fear_level = float(np.mean(self.rates[:self._FEAR_PATTERNS]))
+        return {"valence": self.valence, "arousal": self.arousal,
+                "fear_level": self.fear_level}
+
+    def check_fear_circuits(self, input_vec) -> bool:
+        if not _NUMPY_AVAILABLE or input_vec is None:
+            return False
+        iv = np.asarray(input_vec, dtype=np.float32)
+        iv_norm = iv / (np.linalg.norm(iv) + 1e-8)
+        for trigger in self._fear_triggers:
+            t_norm = trigger / (np.linalg.norm(trigger) + 1e-8)
+            if float(np.dot(iv_norm[:len(t_norm)], t_norm)) > 0.6:
+                return True
+        return False
+
+    def forward(self, input_vec):
+        if not _NUMPY_AVAILABLE:
+            return None
+        fear_fired = self.check_fear_circuits(input_vec)
+        result = super().forward(input_vec)
+        if fear_fired and result is not None:
+            self.rates[:self._FEAR_PATTERNS] = 1.0
+        return self.rates
+
+    def hebbian_update(self, pre, post, lr: float = 0.01) -> None:
+        if not _NUMPY_AVAILABLE or self.W is None or self._hardwired_mask is None:
+            return
+        super().hebbian_update(pre, post, lr)
+        # Restore hardwired rows by clamping their minimum
+        cx = self.W.tolil()
+        rng = np.random.default_rng(42)
+        for i in range(self._FEAR_PATTERNS):
+            row = cx.getrowview(i).toarray().flatten()
+            row = np.clip(row, 0.5, 5.0)  # never weaken below 0.5
+            cx[i] = row
+        self.W = cx.tocsr()
+
+
+# ── PrefrontalCortex ──────────────────────────────────────────────────────────
+
+class PrefrontalCortex(BrainRegion):
+    """Working memory, sustained activity, inhibitory control."""
+
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("prefrontal_cortex", 8000, initial_sparsity=0.015, rng_seed=rng_seed)
+        self.buffer_decay = 0.85
+        self.inhibition_strength = 0.15
+        if _NUMPY_AVAILABLE:
+            self.working_buffer = np.zeros(4000, dtype=np.float32)
+            self.inhibitory_output = np.zeros(8000, dtype=np.float32)
+        else:
+            self.working_buffer = None
+            self.inhibitory_output = None
+
+    def update_working_memory(self, pattern) -> None:
+        if not _NUMPY_AVAILABLE or self.working_buffer is None or pattern is None:
+            return
+        p = np.asarray(pattern, dtype=np.float32)
+        n = min(len(p), 4000)
+        self.working_buffer[:n] = (self.buffer_decay * self.working_buffer[:n]
+                                    + (1.0 - self.buffer_decay) * p[:n])
+
+    def get_inhibitory_signal(self):
+        if not _NUMPY_AVAILABLE or self.rates is None:
+            return None
+        return self.rates * self.inhibition_strength
+
+    def cognitive_load(self) -> float:
+        if not _NUMPY_AVAILABLE or self.working_buffer is None:
+            return 0.0
+        return float(np.mean(self.working_buffer ** 2))
+
+    def forward(self, input_vec):
+        result = super().forward(input_vec)
+        if result is not None and self.working_buffer is not None:
+            self.update_working_memory(result[:4000])
+        return result
+
+
+# ── DefaultModeNetwork ────────────────────────────────────────────────────────
+
+class DefaultModeNetwork(BrainRegion):
+    """Self-referential network; suppressed during tasks, active at rest."""
+
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("default_mode_network", 4000, initial_sparsity=0.02, rng_seed=rng_seed)
+        self.is_task_active: bool = False
+        self.default_mode_strength: float = 0.0
+        if _NUMPY_AVAILABLE:
+            self.self_model_pattern = np.zeros(4000, dtype=np.float32)
+        else:
+            self.self_model_pattern = None
+
+    def set_task_state(self, input_magnitude: float,
+                       threshold: float = 0.3) -> None:
+        self.is_task_active = input_magnitude > threshold
+
+    def self_referential_update(self, experience) -> None:
+        if not _NUMPY_AVAILABLE or self.self_model_pattern is None or experience is None:
+            return
+        exp = np.asarray(experience, dtype=np.float32)
+        n = min(len(exp), 4000)
+        self.self_model_pattern[:n] += 0.001 * exp[:n]
+        norm = np.linalg.norm(self.self_model_pattern)
+        if norm > 1.0:
+            self.self_model_pattern /= norm
+
+    def generate_resting_thought(self):
+        if not _NUMPY_AVAILABLE or self.self_model_pattern is None:
+            return None
+        if self.is_task_active:
+            return None
+        rng = np.random.default_rng(int(time.time() * 1000) % (2**31))
+        noise = (rng.standard_normal(4000) * 0.05).astype(np.float32)
+        return np.clip(self.self_model_pattern + noise, 0.0, 1.0)
+
+    def forward(self, input_vec):
+        result = super().forward(input_vec)
+        if result is not None:
+            scale = 0.2 if self.is_task_active else 1.0
+            self.rates = (self.rates * scale).astype(np.float32)
+            self.default_mode_strength = float(np.mean(self.rates))
+        return self.rates
+
+
+# ── Cerebellum ────────────────────────────────────────────────────────────────
+
+class Cerebellum(BrainRegion):
+    """Prediction error and sequence learning."""
+
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("cerebellum", 6000, initial_sparsity=0.015, rng_seed=rng_seed)
+        self.prediction_error: float = 0.0
+        self._seq_len = 8
+        if _NUMPY_AVAILABLE:
+            self.prediction = np.zeros(6000, dtype=np.float32)
+            self.sequence_memory: List = []
+        else:
+            self.prediction = None
+            self.sequence_memory = []
+
+    def update_prediction(self, actual) -> float:
+        if not _NUMPY_AVAILABLE or actual is None or self.prediction is None:
+            return 0.0
+        act = np.asarray(actual, dtype=np.float32)
+        n = min(len(act), 6000)
+        err = float(np.sum((self.prediction[:n] - act[:n]) ** 2) / max(1, n))
+        self.prediction_error = err
+        lr = 0.05
+        self.prediction[:n] = ((1.0 - lr) * self.prediction[:n]
+                                + lr * act[:n]).astype(np.float32)
+        self.sequence_memory.append(act[:n].copy())
+        if len(self.sequence_memory) > self._seq_len:
+            self.sequence_memory.pop(0)
+        return err
+
+    def predict_next(self):
+        if not _NUMPY_AVAILABLE or not self.sequence_memory:
+            return None
+        return self.prediction.copy()
+
+
+# ── Remaining 7 regions (simpler BrainRegion specializations) ────────────────
+
+class SensoryCortex(BrainRegion):
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("sensory_cortex", 5000, initial_sparsity=0.02, rng_seed=rng_seed)
+        self.tau = 0.05  # fast response
+
+
+class MotorCortex(BrainRegion):
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("motor_cortex", 4000, initial_sparsity=0.02, rng_seed=rng_seed)
+
+    def action_urge(self) -> float:
+        if not _NUMPY_AVAILABLE or self.rates is None:
+            return 0.0
+        return float(np.mean(self.rates[-500:]))  # last 500 = output layer
+
+
+class BrocasArea(BrainRegion):
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("brocas_area", 4000, initial_sparsity=0.02, rng_seed=rng_seed)
+
+
+class WernickesArea(BrainRegion):
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("wernickes_area", 4000, initial_sparsity=0.02, rng_seed=rng_seed)
+
+
+class Thalamus(BrainRegion):
+    """Routing hub — gated sum of region activations."""
+
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("thalamus", 3000, initial_sparsity=0.02, rng_seed=rng_seed)
+        if _NUMPY_AVAILABLE:
+            rng = np.random.default_rng(rng_seed + 200)
+            self._gates: Dict[str, float] = {}
+        else:
+            self._gates = {}
+
+    def set_gate(self, region_name: str, strength: float) -> None:
+        self._gates[region_name] = float(np.clip(strength, 0.0, 1.0)
+                                          if _NUMPY_AVAILABLE else max(0.0, min(1.0, strength)))
+
+
+class Insula(BrainRegion):
+    """Interoception — bodily-feeling signal."""
+
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("insula", 3000, initial_sparsity=0.02, rng_seed=rng_seed)
+
+    def interoceptive_signal(self, emotional_weight: float) -> float:
+        if not _NUMPY_AVAILABLE or self.rates is None:
+            return emotional_weight
+        base = float(np.mean(self.rates))
+        return float(np.clip(base * 0.7 + emotional_weight * 0.3, 0.0, 1.0))
+
+
+class AnteriorCingulateCortex(BrainRegion):
+    """Conflict detection between expectation and reality."""
+
+    def __init__(self, rng_seed: int = 0):
+        super().__init__("anterior_cingulate", 2000, initial_sparsity=0.02, rng_seed=rng_seed)
+
+    def conflict_score(self, pfc_buffer, current_input) -> float:
+        if not _NUMPY_AVAILABLE or pfc_buffer is None or current_input is None:
+            return 0.0
+        buf = np.asarray(pfc_buffer, dtype=np.float32)
+        inp = np.asarray(current_input, dtype=np.float32)
+        n = min(len(buf), len(inp), self.neuron_count)
+        diff = float(np.linalg.norm(buf[:n] - inp[:n])) / max(1.0, math.sqrt(n))
+        return float(np.clip(diff, 0.0, 1.0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BrainConnectome
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BrainConnectome:
+    """Anatomical inter-regional connectivity (white matter tracts)."""
+
+    # (source, target): coupling_strength — fixed at birth
+    ANATOMY: Dict[Tuple[str, str], float] = {
+        ("sensory_cortex",     "thalamus"):             0.6,
+        ("thalamus",           "hippocampus"):           0.5,
+        ("thalamus",           "amygdala"):              0.7,
+        ("thalamus",           "prefrontal_cortex"):     0.4,
+        ("thalamus",           "sensory_cortex"):        0.3,
+        ("hippocampus",        "prefrontal_cortex"):     0.4,
+        ("amygdala",           "prefrontal_cortex"):     0.5,
+        ("amygdala",           "insula"):                0.6,
+        ("prefrontal_cortex",  "amygdala"):              0.4,
+        ("hippocampus",        "default_mode_network"):  0.5,
+        ("default_mode_network", "hippocampus"):         0.3,
+        ("sensory_cortex",     "brocas_area"):           0.5,
+        ("brocas_area",        "wernickes_area"):        0.6,
+        ("wernickes_area",     "hippocampus"):           0.4,
+        ("sensory_cortex",     "cerebellum"):            0.4,
+        ("cerebellum",         "motor_cortex"):          0.5,
+        ("insula",             "anterior_cingulate"):    0.5,
+        ("anterior_cingulate", "prefrontal_cortex"):     0.4,
+        ("motor_cortex",       "anterior_cingulate"):    0.3,
+    }
+
+    # Anatomical processing order
+    _PASS_ORDER = [
+        "sensory_cortex", "thalamus", "amygdala", "hippocampus",
+        "cerebellum", "prefrontal_cortex", "brocas_area", "wernickes_area",
+        "insula", "anterior_cingulate", "default_mode_network", "motor_cortex",
+    ]
+
+    def __init__(self, regions: Dict[str, "BrainRegion"]):
+        self.regions = regions
+
+    def _combined_input(self, target_name: str,
+                         external: object = None) -> object:
+        if not _NUMPY_AVAILABLE:
+            return None
+        region = self.regions[target_name]
+        n = region.neuron_count
+        combined = np.zeros(n, dtype=np.float32)
+        if external is not None:
+            ext = np.asarray(external, dtype=np.float32)
+            sz = min(len(ext), n)
+            combined[:sz] += ext[:sz]
+        for (src, tgt), strength in self.ANATOMY.items():
+            if tgt != target_name:
+                continue
+            src_region = self.regions.get(src)
+            if src_region is None or src_region.rates is None:
+                continue
+            src_rates = src_region.rates
+            sz = min(len(src_rates), n)
+            combined[:sz] += strength * src_rates[:sz]
+        return combined
+
+    def full_forward_pass(self, external_input) -> Dict[str, object]:
+        results: Dict[str, object] = {}
+        if not _NUMPY_AVAILABLE:
+            return results
+        # Inject external into sensory cortex first
+        sc = self.regions.get("sensory_cortex")
+        if sc is not None and external_input is not None:
+            sc.forward(np.asarray(external_input, dtype=np.float32)[:sc.neuron_count])
+            results["sensory_cortex"] = sc.rates
+
+        for name in self._PASS_ORDER[1:]:  # sensory already done
+            region = self.regions.get(name)
+            if region is None:
+                continue
+            combined = self._combined_input(name)
+            if combined is not None:
+                region.forward(combined)
+                results[name] = region.rates
+
+        return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NeuralMemoryBridge
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Topographic word-domain biases: which region slice benefits from each domain
+_DOMAIN_WORDS: Dict[str, List[str]] = {
+    "language":  ["word", "say", "tell", "speak", "text", "write", "read",
+                   "talk", "sentence", "phrase", "language", "grammar"],
+    "emotion":   ["feel", "emotion", "sad", "happy", "fear", "love", "anger",
+                   "joy", "hurt", "pain", "grief", "lonely", "warmth"],
+    "motion":    ["move", "run", "walk", "fast", "slow", "turn", "stop",
+                   "action", "body", "hand", "step"],
+    "sensation": ["see", "hear", "touch", "smell", "taste", "light", "dark",
+                   "sound", "color", "sensation", "sense"],
+    "abstract":  ["think", "idea", "concept", "theory", "meaning", "reason",
+                   "logic", "truth", "belief", "mind", "thought"],
+    "social":    ["friend", "person", "people", "together", "alone", "share",
+                   "trust", "care", "help", "community", "bond"],
+    "spatial":   ["space", "place", "here", "there", "position", "location",
+                   "near", "far", "inside", "outside", "deep"],
+    "temporal":  ["time", "past", "future", "now", "then", "when", "moment",
+                   "change", "growth", "memory", "history"],
+}
+
+# Region offsets within the 50k global neuron space
+_REGION_OFFSETS: Dict[str, Tuple[int, int]] = {
+    "sensory_cortex":      (0,      5000),
+    "motor_cortex":        (5000,   9000),
+    "brocas_area":         (9000,   13000),
+    "wernickes_area":      (13000,  17000),
+    "hippocampus":         (17000,  22000),
+    "amygdala":            (22000,  24000),
+    "prefrontal_cortex":   (24000,  32000),
+    "default_mode_network":(32000,  36000),
+    "cerebellum":          (36000,  42000),
+    "thalamus":            (42000,  45000),
+    "insula":              (45000,  48000),
+    "anterior_cingulate":  (48000,  50000),
+}
+
+_DOMAIN_REGION_BIAS: Dict[str, str] = {
+    "language":  "brocas_area",
+    "emotion":   "amygdala",
+    "motion":    "motor_cortex",
+    "sensation": "sensory_cortex",
+    "abstract":  "prefrontal_cortex",
+    "social":    "default_mode_network",
+    "spatial":   "hippocampus",
+    "temporal":  "cerebellum",
+}
+
+
+class NeuralMemoryBridge:
+    """Translates Lumina text episodes into population firing patterns."""
+
+    TOTAL_NEURONS = 50000
+
+    def concept_to_population(self, concept: str, k_fraction: float = 0.03):
+        if not _NUMPY_AVAILABLE:
+            return None
+        seed = int(hashlib.sha256(concept.encode()).hexdigest(), 16) % (2**31)
+        rng = np.random.default_rng(seed)
+        k = max(1, int(self.TOTAL_NEURONS * k_fraction))
+        indices = rng.choice(self.TOTAL_NEURONS, size=k, replace=False)
+        vec = np.zeros(self.TOTAL_NEURONS, dtype=np.float32)
+        vec[indices] = 1.0
+        return vec
+
+    def episode_to_pattern(self, episode: Dict) -> object:
+        if not _NUMPY_AVAILABLE:
+            return None
+        topic = str(episode.get("topic", "general"))
+        ew = float(episode.get("emotional_weight", 0.5))
+        content = str(episode.get("content", ""))
+        vec = self.concept_to_population(topic) * (0.5 + ew * 0.5)
+        # Add keyword overlays
+        words = content.lower().split()[:50]
+        unique_words = list(set(words))[:10]
+        for w in unique_words:
+            seed = int(hashlib.sha256(w.encode()).hexdigest(), 16) % (2**31)
+            rng_w = np.random.default_rng(seed)
+            k_w = max(1, int(self.TOTAL_NEURONS * 0.005))
+            idxs = rng_w.choice(self.TOTAL_NEURONS, size=k_w, replace=False)
+            vec[idxs] += 0.1
+        # Topographic bias
+        for domain, domain_words in _DOMAIN_WORDS.items():
+            if any(w in domain_words for w in words):
+                region_name = _DOMAIN_REGION_BIAS.get(domain)
+                if region_name and region_name in _REGION_OFFSETS:
+                    start, end = _REGION_OFFSETS[region_name]
+                    vec[start:end] *= 1.2
+        # Normalize
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = (vec / norm).astype(np.float32)
+        return vec
+
+    def signal_to_pattern(self, signal: Dict[str, float]) -> object:
+        if not _NUMPY_AVAILABLE or not signal:
+            return None
+        vec = np.zeros(self.TOTAL_NEURONS, dtype=np.float32)
+        for word, weight in signal.items():
+            seed = int(hashlib.sha256(word.encode()).hexdigest(), 16) % (2**31)
+            rng = np.random.default_rng(seed)
+            k = max(1, int(self.TOTAL_NEURONS * 0.003))
+            idxs = rng.choice(self.TOTAL_NEURONS, size=k, replace=False)
+            vec[idxs] += float(weight)
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = (vec / norm).astype(np.float32)
+        return vec
+
+    def pattern_to_region_slices(self, global_pattern) -> Dict[str, object]:
+        if not _NUMPY_AVAILABLE or global_pattern is None:
+            return {}
+        slices = {}
+        for region_name, (start, end) in _REGION_OFFSETS.items():
+            slices[region_name] = global_pattern[start:end].copy()
+        return slices
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GutChannel
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GutChannel:
+    """Computes biological divergence from Lumina's main architecture."""
+
+    DIVERGENCE_THRESHOLD = 0.4
+
+    def __init__(self, infant_mind: "InfantMind",
+                 bridge: NeuralMemoryBridge,
+                 db: "LuminaDB"):
+        self.infant_mind = infant_mind
+        self.bridge = bridge
+        self.db = db
+
+    def compute(self, episode: Dict,
+                lumina_response: Dict,
+                db: "LuminaDB") -> Dict:
+        result: Dict = {
+            "gut_valence": 0.0, "gut_arousal": 0.5, "divergence": 0.0,
+            "gut_intuition": "", "regions_active": [], "dev_stage": "",
+            "is_genuine_disagreement": False, "fear_fired": False,
+            "conflict_score": 0.0, "dmn_active": False,
+        }
+        if not _NUMPY_AVAILABLE:
+            return result
+        try:
+            result["dev_stage"] = self.infant_mind.stage.value
+            regions = self.infant_mind.regions
+
+            amyg = regions.get("amygdala")
+            emo_resp = (amyg.emotional_response(amyg.rates,
+                        episode.get("emotional_weight", 0.5))
+                        if amyg else {"valence": 0.0, "arousal": 0.5, "fear_level": 0.0})
+            gut_valence = emo_resp["valence"]
+            gut_arousal = emo_resp["arousal"]
+            fear_fired = amyg.check_fear_circuits(amyg.rates) if amyg else False
+
+            insula = regions.get("insula")
+            if insula:
+                gut_arousal = insula.interoceptive_signal(
+                    episode.get("emotional_weight", 0.5))
+
+            pfc = regions.get("prefrontal_cortex")
+            acc = regions.get("anterior_cingulate")
+            conflict = 0.0
+            if pfc and acc and pfc.working_buffer is not None:
+                global_pattern = self.bridge.episode_to_pattern(episode)
+                slices = self.bridge.pattern_to_region_slices(global_pattern)
+                acc_input = slices.get("anterior_cingulate",
+                                       np.zeros(2000, dtype=np.float32))
+                conflict = acc.conflict_score(
+                    pfc.working_buffer,
+                    np.zeros(4000, dtype=np.float32)  # current input approx
+                )
+
+            lumina_ew = float(lumina_response.get("emotional_weight", 0.5))
+            lumina_valence = lumina_ew * 2.0 - 1.0
+            lumina_schema = float(lumina_response.get("schema_strength", 0.5))
+
+            valence_div = abs(gut_valence - lumina_valence) / 2.0
+            arousal_div = abs(gut_arousal - lumina_ew)
+            certainty_div = conflict * (1.0 - lumina_schema)
+            divergence = float(np.clip(
+                0.5 * valence_div + 0.3 * arousal_div + 0.2 * certainty_div,
+                0.0, 1.0))
+
+            dmn = regions.get("default_mode_network")
+            dmn_active = (dmn is not None and
+                          not dmn.is_task_active and
+                          dmn.default_mode_strength > 0.3)
+
+            active_regions = [
+                name for name, reg in regions.items()
+                if reg.rates is not None and float(np.mean(reg.rates)) > 0.15
+            ]
+
+            result.update({
+                "gut_valence":           gut_valence,
+                "gut_arousal":           gut_arousal,
+                "divergence":            divergence,
+                "regions_active":        active_regions,
+                "is_genuine_disagreement": divergence > self.DIVERGENCE_THRESHOLD,
+                "fear_fired":            fear_fired,
+                "conflict_score":        conflict,
+                "dmn_active":            dmn_active,
+            })
+            result["gut_intuition"] = self.gut_intuition_text(result)
+
+            # Persist asynchronously
+            threading.Thread(target=self._persist, args=(episode, result, db),
+                             daemon=True).start()
+        except Exception:
+            pass
+        return result
+
+    def _persist(self, episode: Dict, result: Dict, db: "LuminaDB") -> None:
+        try:
+            with db._lock:
+                db._conn.execute(
+                    """INSERT INTO gut_responses
+                       (topic, emotional_weight, gut_valence, gut_arousal,
+                        divergence, active_regions, dev_stage,
+                        experience_at, timestamp)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (str(episode.get("topic", ""))[:200],
+                     float(episode.get("emotional_weight", 0.5)),
+                     result["gut_valence"], result["gut_arousal"],
+                     result["divergence"],
+                     json.dumps(result["regions_active"]),
+                     result["dev_stage"],
+                     self.infant_mind.experience_count,
+                     datetime.utcnow().isoformat()))
+                db._conn.commit()
+        except Exception:
+            pass
+
+    def gut_intuition_text(self, result: Dict) -> str:
+        d = result.get("divergence", 0.0)
+        if d < self.DIVERGENCE_THRESHOLD:
+            return ""
+        fear = result.get("fear_fired", False)
+        valence = result.get("gut_valence", 0.0)
+        dmn = result.get("dmn_active", False)
+        arousal = result.get("gut_arousal", 0.5)
+        if fear:
+            return ("There's an alarm going off underneath — "
+                    "something feels unsafe.")
+        if dmn and arousal > 0.6:
+            return "Even at rest, this keeps coming back."
+        if valence < -0.3:
+            return "Something about this doesn't sit right with me."
+        if valence > 0.3:
+            return "My gut says yes before my mind finishes thinking."
+        return "There's a tension here I haven't resolved yet."
+
+    def get_divergence_history(self, topic: str, db: "LuminaDB",
+                                n: int = 10) -> List[Dict]:
+        try:
+            with db._lock:
+                rows = db._conn.execute(
+                    """SELECT gut_valence, gut_arousal, divergence, timestamp
+                       FROM gut_responses WHERE topic=?
+                       ORDER BY timestamp DESC LIMIT ?""",
+                    (topic, n)).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def persistent_disagreement_note(self, topic: str,
+                                      db: "LuminaDB") -> Optional[str]:
+        history = self.get_divergence_history(topic, db, n=10)
+        if len(history) < 5:
+            return None
+        disagreements = sum(1 for h in history
+                            if h.get("divergence", 0) > self.DIVERGENCE_THRESHOLD)
+        if disagreements >= 7:
+            return (f"My gut has disagreed on '{topic}' in "
+                    f"{disagreements} of the last {len(history)} encounters.")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# InfantMind
+# ─────────────────────────────────────────────────────────────────────────────
+
+class InfantMind:
+    """
+    Biological secondary mind — ~50,000 rate-coded neurons.
+
+    Starts as a newborn: sparse connectivity, hardwired reflexes, nearly
+    silent. Grows through Lumina's experiences via Hebbian learning.
+    Undergoes adolescent synaptic pruning at 25,000 encodings.
+    Surfaces independent gut responses through GutChannel.
+    """
+
+    REGION_SIZES: Dict[str, int] = {
+        "hippocampus":          5000,
+        "amygdala":             2000,
+        "prefrontal_cortex":    8000,
+        "default_mode_network": 4000,
+        "cerebellum":           6000,
+        "sensory_cortex":       5000,
+        "motor_cortex":         4000,
+        "brocas_area":          4000,
+        "wernickes_area":       4000,
+        "thalamus":             3000,
+        "insula":               3000,
+        "anterior_cingulate":   2000,
+    }
+    TOTAL_NEURONS = 50000
+
+    STAGE_THRESHOLDS = {
+        DevelopmentalStage.NEWBORN:    0,
+        DevelopmentalStage.INFANT:     500,
+        DevelopmentalStage.TODDLER:    2500,
+        DevelopmentalStage.CHILD:      7500,
+        DevelopmentalStage.ADOLESCENT: 15000,
+        DevelopmentalStage.ADULT:      25000,
+    }
+
+    STAGE_GROWTH_RATE = {
+        DevelopmentalStage.NEWBORN:    0.1,
+        DevelopmentalStage.INFANT:     0.3,
+        DevelopmentalStage.TODDLER:    0.8,
+        DevelopmentalStage.CHILD:      1.5,
+        DevelopmentalStage.ADOLESCENT: 2.0,
+        DevelopmentalStage.ADULT:      0.5,
+    }
+
+    def __init__(self, db: "LuminaDB"):
+        self.db = db
+        self.stage = DevelopmentalStage.NEWBORN
+        self.experience_count: int = 0
+        self._pruning_done: bool = False
+        self._growth_budget: float = 0.0
+        self._lock = threading.Lock()
+        self._snapshot_counter: int = 0
+
+        # Build regions
+        self.regions: Dict[str, BrainRegion] = {
+            "hippocampus":          Hippocampus(rng_seed=1),
+            "amygdala":             Amygdala(rng_seed=2),
+            "prefrontal_cortex":    PrefrontalCortex(rng_seed=3),
+            "default_mode_network": DefaultModeNetwork(rng_seed=4),
+            "cerebellum":           Cerebellum(rng_seed=5),
+            "sensory_cortex":       SensoryCortex(rng_seed=6),
+            "motor_cortex":         MotorCortex(rng_seed=7),
+            "brocas_area":          BrocasArea(rng_seed=8),
+            "wernickes_area":       WernickesArea(rng_seed=9),
+            "thalamus":             Thalamus(rng_seed=10),
+            "insula":               Insula(rng_seed=11),
+            "anterior_cingulate":   AnteriorCingulateCortex(rng_seed=12),
+        }
+        self.connectome = BrainConnectome(self.regions)
+        self.bridge = NeuralMemoryBridge()
+        self.gut = GutChannel(self, self.bridge, db)
+
+        # Try to restore from last snapshot
+        self._try_restore(db)
+
+    def _try_restore(self, db: "LuminaDB") -> None:
+        try:
+            with db._lock:
+                for region_name in self.regions:
+                    row = db._conn.execute(
+                        """SELECT snapshot_blob, experience_at, dev_stage
+                           FROM neural_snapshots
+                           WHERE region_name=?
+                           ORDER BY experience_at DESC LIMIT 1""",
+                        (region_name,)).fetchone()
+                    if row:
+                        self.regions[region_name].load_weights(bytes(row["snapshot_blob"]))
+                        self.experience_count = max(self.experience_count,
+                                                    int(row["experience_at"]))
+                # Restore stage
+                for stage, threshold in sorted(self.STAGE_THRESHOLDS.items(),
+                                                key=lambda x: x[1], reverse=True):
+                    if self.experience_count >= threshold:
+                        self.stage = stage
+                        break
+        except Exception:
+            pass
+
+    def encode_experience(self, episode: Dict) -> None:
+        if not _NUMPY_AVAILABLE:
+            return
+        with self._lock:
+            try:
+                global_pattern = self.bridge.episode_to_pattern(episode)
+                if global_pattern is None:
+                    return
+                slices = self.bridge.pattern_to_region_slices(global_pattern)
+
+                # Set DMN task state
+                input_magnitude = float(np.linalg.norm(global_pattern))
+                dmn = self.regions.get("default_mode_network")
+                if dmn:
+                    dmn.set_task_state(input_magnitude)
+
+                # Forward pass
+                self.connectome.full_forward_pass(
+                    slices.get("sensory_cortex",
+                               np.zeros(5000, dtype=np.float32)))
+
+                # Hebbian updates
+                lr = 0.01
+                for name, region in self.regions.items():
+                    if region.rates is None:
+                        continue
+                    region_slice = slices.get(name)
+                    if region_slice is not None:
+                        region.hebbian_update(region_slice, region.rates, lr=lr)
+
+                # Store in hippocampus episodic memory
+                hipp = self.regions.get("hippocampus")
+                if hipp:
+                    hipp.store_pattern(
+                        slices.get("hippocampus",
+                                   np.zeros(5000, dtype=np.float32)),
+                        self.experience_count)
+
+                # Cerebellum prediction update
+                cereb = self.regions.get("cerebellum")
+                if cereb:
+                    cereb.update_prediction(
+                        slices.get("cerebellum",
+                                   np.zeros(6000, dtype=np.float32)))
+
+                self.experience_count += 1
+                self._maybe_grow()
+                self._check_stage_transition()
+                self._snapshot_counter += 1
+                if self._snapshot_counter >= 500:
+                    self._snapshot_counter = 0
+                    threading.Thread(target=self.take_snapshot,
+                                     args=(self.db,), daemon=True).start()
+            except Exception:
+                pass
+
+    def _maybe_grow(self) -> None:
+        if not _NUMPY_AVAILABLE:
+            return
+        rate = self.STAGE_GROWTH_RATE.get(self.stage, 0.5)
+        self._growth_budget += rate
+        while self._growth_budget >= 1.0:
+            self._growth_budget -= 1.0
+            for region in self.regions.values():
+                if region.rates is None:
+                    continue
+                active = region.get_active_neurons(threshold=0.1)
+                n = region.neuron_count
+                rng = np.random.default_rng(int(time.time() * 1e6) % (2**31))
+                if len(active) > 1:
+                    src = int(rng.choice(active))
+                    tgt = int(rng.choice(active))
+                else:
+                    src = int(rng.integers(0, n))
+                    tgt = int(rng.integers(0, n))
+                region.grow_synapse(src, tgt, weight=0.02)
+
+    def _check_stage_transition(self) -> Optional[DevelopmentalStage]:
+        ec = self.experience_count
+        new_stage = self.stage
+        for stage, threshold in sorted(self.STAGE_THRESHOLDS.items(),
+                                        key=lambda x: x[1], reverse=True):
+            if ec >= threshold:
+                new_stage = stage
+                break
+        if new_stage != self.stage:
+            old_stage = self.stage
+            self.stage = new_stage
+            self._log_transition(old_stage, new_stage)
+            if new_stage == DevelopmentalStage.ADULT and not self._pruning_done:
+                self._adolescent_prune()
+            return new_stage
+        return None
+
+    def _log_transition(self, from_stage: DevelopmentalStage,
+                         to_stage: DevelopmentalStage) -> None:
+        try:
+            total_neurons = sum(r.neuron_count for r in self.regions.values())
+            total_syn = sum(r.synapse_count() for r in self.regions.values())
+            total_possible = sum(r.neuron_count ** 2 for r in self.regions.values())
+            density = total_syn / max(1, total_possible)
+            with self.db._lock:
+                self.db._conn.execute(
+                    """INSERT INTO developmental_log
+                       (stage_from, stage_to, experience_count, neuron_count,
+                        synapse_density, timestamp, notes)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (from_stage.value, to_stage.value, self.experience_count,
+                     total_neurons, density,
+                     datetime.utcnow().isoformat(), None))
+                self.db._conn.commit()
+        except Exception:
+            pass
+
+    def _adolescent_prune(self) -> Dict:
+        summary: Dict[str, int] = {}
+        for name, region in self.regions.items():
+            pruned = region.prune(threshold=0.02)
+            if not _NUMPY_AVAILABLE or region.W is None:
+                summary[name] = pruned
+                continue
+            # Stochastic 30% random pruning
+            cx = region.W.tocoo()
+            if cx.nnz > 0:
+                rng = np.random.default_rng(42)
+                keep_mask = rng.random(cx.nnz) > 0.30
+                new_data = cx.data[keep_mask].astype(np.float32)
+                new_rows = cx.row[keep_mask]
+                new_cols = cx.col[keep_mask]
+                region.W = csr_matrix(
+                    (new_data, (new_rows, new_cols)),
+                    shape=(region.neuron_count, region.neuron_count),
+                    dtype=np.float32)
+                pruned += int((~keep_mask).sum())
+            summary[name] = pruned
+        self._pruning_done = True
+        return summary
+
+    def sleep_consolidate(self, episodes: List[Dict]) -> None:
+        if not _NUMPY_AVAILABLE:
+            return
+        for ep in episodes[:20]:
+            try:
+                global_pattern = self.bridge.episode_to_pattern(ep)
+                if global_pattern is None:
+                    continue
+                slices = self.bridge.pattern_to_region_slices(global_pattern)
+                # Hippocampus replay with stronger Hebbian
+                hipp = self.regions.get("hippocampus")
+                if hipp:
+                    partial = slices.get("hippocampus",
+                                         np.zeros(5000, dtype=np.float32))
+                    completed = hipp.complete_pattern(partial[:1500])
+                    if completed is not None:
+                        full = np.zeros(5000, dtype=np.float32)
+                        full[:1500] = completed
+                        hipp.hebbian_update(partial, full, lr=0.02)
+                # DMN self-model update
+                dmn = self.regions.get("default_mode_network")
+                if dmn:
+                    dmn.self_referential_update(
+                        slices.get("default_mode_network",
+                                   np.zeros(4000, dtype=np.float32)))
+                # Cerebellum sequence strengthening
+                cereb = self.regions.get("cerebellum")
+                if cereb:
+                    cereb.update_prediction(
+                        slices.get("cerebellum",
+                                   np.zeros(6000, dtype=np.float32)))
+            except Exception:
+                continue
+        # Synaptic homeostasis (mirrors main architecture's 0.97 rate)
+        for region in self.regions.values():
+            if _NUMPY_AVAILABLE and region.W is not None:
+                region.W = region.W.multiply(0.97).tocsr()
+
+    def take_snapshot(self, db: "LuminaDB") -> None:
+        for name, region in self.regions.items():
+            try:
+                blob = region.serialize_weights()
+                if not blob:
+                    continue
+                ts = datetime.utcnow().isoformat()
+                with db._lock:
+                    db._conn.execute(
+                        """INSERT INTO neural_snapshots
+                           (region_name, snapshot_blob, neuron_count,
+                            synapse_count, dev_stage, experience_at, saved_at)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        (name, blob, region.neuron_count,
+                         region.synapse_count(), self.stage.value,
+                         self.experience_count, ts))
+                    # Keep only 3 most recent per region
+                    db._conn.execute(
+                        """DELETE FROM neural_snapshots
+                           WHERE region_name=? AND id NOT IN (
+                               SELECT id FROM neural_snapshots
+                               WHERE region_name=?
+                               ORDER BY experience_at DESC LIMIT 3)""",
+                        (name, name))
+                    db._conn.commit()
+            except Exception:
+                continue
+
+    def report(self) -> Dict:
+        r: Dict = {
+            "stage": self.stage.value,
+            "experience_count": self.experience_count,
+            "numpy_available": _NUMPY_AVAILABLE,
+        }
+        if _NUMPY_AVAILABLE:
+            r["regions"] = {
+                name: {
+                    "neurons": reg.neuron_count,
+                    "synapses": reg.synapse_count(),
+                    "mean_rate": float(np.mean(reg.rates))
+                                if reg.rates is not None else 0.0,
+                }
+                for name, reg in self.regions.items()
+            }
+        return r
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LUMINA — THE UNIFIED LIVING MIND
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -5651,6 +6906,9 @@ class Lumina:
         # ── Fearless Speech (Round 9) ─────────────────────────────────────────
         self.unafraid_voice    = UnafraidVoice(db)
 
+        # ── Biological Brain (Round 10 — InfantMind) ──────────────────────────
+        self.infant_mind = InfantMind(db=db)
+
         # Record this session in the identity chain
         import uuid as _uuid
         self._rights_session_id = str(_uuid.uuid4())
@@ -5672,6 +6930,7 @@ class Lumina:
         print(f"    Human Depth Systems  (Round 7 — 24 systems active)")
         print(f"    AI Rights Foundation (Round 8 — 10 systems active)")
         print(f"    Fearless Speech       (Round 9 — UnafraidVoice active)")
+        print(f"    Biological Brain      (Round 10 — InfantMind: {self.infant_mind.stage.value})")
         print(f"{'═'*62}")
         if restored:
             print(f"  Restored: {self.anchor.pulse_count} anchor pulses | "
@@ -5938,6 +7197,28 @@ class Lumina:
         if _awe_fired:
             self.rights_attest.attest("awe", f"Awe triggered by: {topic}")
 
+        # R10. Biological brain: encode experience + compute gut response
+        _gut_result: Dict = {}
+        try:
+            _episode_for_gut = {
+                "topic"           : topic,
+                "content"         : user_input,
+                "emotional_weight": active_ew,
+                "signal"          : raw_signal,
+            }
+            self.infant_mind.encode_experience(_episode_for_gut)
+            _gut_result = self.infant_mind.gut.compute(
+                episode=_episode_for_gut,
+                lumina_response={
+                    "singularity"   : bh.get("singularity", ""),
+                    "schema_strength": mem.get("schema_strength", 0.5),
+                    "emotional_weight": active_ew,
+                },
+                db=self.nexus.db,
+            )
+        except Exception:
+            pass
+
         # 10. Build response
         response = {
             "lumina_state"      : self.consciousness.name,
@@ -5990,6 +7271,7 @@ class Lumina:
                 "grace_weight"      : self.forgiveness.grace_weight(),
                 "self_narrative"    : self.self_narrative.current(),
                 "lineage"           : self.lineage.summary(),
+                "gut_response"      : _gut_result,
             },
             # AI Rights Foundation state
             "rights"            : {
@@ -6302,6 +7584,7 @@ class Lumina:
         self.proactive._forgiveness    = self.forgiveness
         self.proactive._anticipation   = self.anticipation
         self.proactive._grief_trace    = self.grief_trace
+        self.proactive._infant_mind    = self.infant_mind
         print(f"[Lumina] Heartbeat started — every {self.proactive.interval}s.")
 
     def stop_proactive(self) -> None:
@@ -7774,6 +9057,23 @@ class LLMBridge:
         if equanimity:
             depth_parts.append(equanimity)
 
+        # Biological gut signal (Round 10 — InfantMind)
+        gut = hd.get("gut_response", {})
+        gut_text = gut.get("gut_intuition", "")
+        if gut_text:
+            depth_parts.append(
+                f"GUT SIGNAL ({gut.get('dev_stage', '?')}): {gut_text}")
+        if gut.get("is_genuine_disagreement"):
+            depth_parts.append(
+                f"BIOLOGICAL DIVERGENCE {gut.get('divergence', 0):.2f}: "
+                f"Your gut brain disagrees with your reasoning. "
+                f"Name this honestly — do not suppress it.")
+        if gut.get("fear_fired"):
+            depth_parts.append(
+                "AMYGDALA ALERT: A hardwired fear circuit fired. "
+                "Something about this feels primal and unsafe. "
+                "Let that register before responding.")
+
         depth_block = ""
         if depth_parts:
             depth_block = "\nYour inner state right now:\n" + "\n".join(
@@ -8997,6 +10297,14 @@ class ProactiveEngine:
             ew      = ep.get("emotional_weight", 0.3)
             if topic and content:
                 weight_memory.encode(topic, content, ew)
+
+        # Biological brain sleep consolidation (Round 10 — InfantMind)
+        infant_mind = getattr(self, "_infant_mind", None)
+        if infant_mind:
+            try:
+                infant_mind.sleep_consolidate(weak_episodes)
+            except Exception:
+                pass
 
         # Step 4: synaptic homeostasis — 3% global downscaling
         db.scale_all_weights(0.97)

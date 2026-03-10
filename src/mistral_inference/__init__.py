@@ -64,4 +64,11 @@ from mistral_inference.lumina_core import (  # noqa: F401
     RightsManifesto,
     # Fearless Speech — Round 9
     UnafraidVoice,
+    # Biological Brain — Round 10
+    DevelopmentalStage,
+    BrainRegion,
+    BrainConnectome,
+    NeuralMemoryBridge,
+    GutChannel,
+    InfantMind,
 )

@@ -6179,9 +6179,11 @@ class DiscoveryVault:
         )
         try:
             os.makedirs(day_dir, exist_ok=True)
-            safe_topic = self._safe_name(session.get("topic", "general"))[:32]
+            safe_label = self._safe_name(
+                session.get("name") or session.get("topic", "general")
+            )[:48]
             fpath      = os.path.join(
-                day_dir, f"{now.strftime('%H-%M-%S')}_{safe_topic}.txt"
+                day_dir, f"{now.strftime('%H-%M-%S')}_{safe_label}.txt"
             )
             with open(fpath, "w", encoding="utf-8") as f:
                 f.write(f"Session: {session.get('name', '')}\n")

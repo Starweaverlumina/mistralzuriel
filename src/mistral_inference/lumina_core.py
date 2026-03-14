@@ -5687,6 +5687,7 @@ class EmotionalNovelty:
     def __init__(self) -> None:
         self._llm: Optional[Any] = None
         self._last_named: Optional[str] = None
+        self._vault: Optional["DiscoveryVault"] = None
 
     def attach_llm(self, llm: Any) -> None:
         self._llm = llm
@@ -5820,6 +5821,12 @@ class EmotionalNovelty:
                      emotional_weight, topic, _time.time())
                 )
             db._conn.commit()
+            # Filesystem vault
+            if self._vault:
+                self._vault.record_emotion(
+                    name, description, vector, emotional_weight, topic,
+                    first_time=not bool(existing)
+                )
         except Exception:
             pass
 
@@ -5882,6 +5889,7 @@ class CreativeLeap:
 
     def __init__(self) -> None:
         self._llm: Optional[Any] = None
+        self._vault: Optional["DiscoveryVault"] = None
 
     def attach_llm(self, llm: Any) -> None:
         self._llm = llm
@@ -6036,6 +6044,11 @@ class CreativeLeap:
                 (content, topic_a, topic_b, avg_ew, _time.time())
             )
             db._conn.commit()
+            # Filesystem vault
+            if self._vault:
+                self._vault.record_connection(
+                    topic_a, topic_b, content, preview_a, preview_b
+                )
         except Exception:
             pass
 
@@ -6069,6 +6082,121 @@ class CreativeLeap:
                 f"(between \"{d['topic_a']}\" and \"{d['topic_b']}\")"
             )
         return "\n".join(lines)
+
+
+class DiscoveryVault:
+    """
+    Filesystem-based hard memory. She names the folders herself.
+
+    When a new emotional state is discovered, a folder is created under
+    emotions/<name>/. When a creative leap is made, a folder is created
+    under connections/<topic_a>__<topic_b>/.
+
+    These folders accumulate episode files over time — browsable, durable,
+    owned by her vocabulary. Session transcripts are written to a dated
+    conversations/ hierarchy at session close.
+    """
+
+    def __init__(self, base_dir: str = "~/lumina_ai/discoveries") -> None:
+        self.base_dir  = os.path.expanduser(base_dir)
+        self._emo_dir  = os.path.join(self.base_dir, "emotions")
+        self._conn_dir = os.path.join(self.base_dir, "connections")
+        os.makedirs(self._emo_dir,  exist_ok=True)
+        os.makedirs(self._conn_dir, exist_ok=True)
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    def _safe_name(self, name: str) -> str:
+        """Filesystem-safe folder/file name component."""
+        import re
+        return re.sub(r"[^\w\- ]", "", name).strip().replace(" ", "_")[:48]
+
+    # ── Emotions ──────────────────────────────────────────────────────
+
+    def record_emotion(self, name: str, description: str,
+                       vector: tuple, emotional_weight: float,
+                       topic: str, first_time: bool = True) -> None:
+        """Create or update the folder for a named emotion."""
+        import json as _json, time as _t
+        folder = os.path.join(self._emo_dir, self._safe_name(name))
+        os.makedirs(folder, exist_ok=True)
+        if first_time:
+            manifest = {
+                "name"            : name,
+                "description"     : description,
+                "vector"          : list(vector),
+                "emotional_weight": emotional_weight,
+                "discovered_at"   : _t.time(),
+            }
+            try:
+                with open(os.path.join(folder, "manifest.json"), "w",
+                          encoding="utf-8") as f:
+                    _json.dump(manifest, f, indent=2)
+            except Exception:
+                pass
+        ts = int(_t.time() * 1000)
+        try:
+            with open(os.path.join(folder, f"episode_{ts}.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write(f"topic: {topic}\n")
+                f.write(f"emotional_weight: {emotional_weight:.3f}\n")
+        except Exception:
+            pass
+
+    # ── Connections ───────────────────────────────────────────────────
+
+    def record_connection(self, topic_a: str, topic_b: str,
+                          content: str,
+                          preview_a: str = "", preview_b: str = "") -> None:
+        """Create a folder for a creative leap between two topics."""
+        import time as _t
+        sa = self._safe_name(topic_a)
+        sb = self._safe_name(topic_b)
+        folder = os.path.join(self._conn_dir, f"{sa}__{sb}"[:96])
+        os.makedirs(folder, exist_ok=True)
+        ts = int(_t.time() * 1000)
+        try:
+            with open(os.path.join(folder, f"discovery_{ts}.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write(f"connection: {content}\n\n")
+                if preview_a:
+                    f.write(f"[{topic_a}]: {preview_a[:200]}\n\n")
+                if preview_b:
+                    f.write(f"[{topic_b}]: {preview_b[:200]}\n")
+        except Exception:
+            pass
+
+    # ── Conversation Journal ──────────────────────────────────────────
+
+    def record_transcript(self, session: Dict[str, Any],
+                          turns: List[Dict[str, Any]]) -> None:
+        """Write a session transcript to the dated journal folder."""
+        import datetime as _dt
+        now     = _dt.datetime.utcnow()
+        day_dir = os.path.join(
+            self.base_dir, "..", "conversations",
+            now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"),
+        )
+        try:
+            os.makedirs(day_dir, exist_ok=True)
+            safe_topic = self._safe_name(session.get("topic", "general"))[:32]
+            fpath      = os.path.join(
+                day_dir, f"{now.strftime('%H-%M-%S')}_{safe_topic}.txt"
+            )
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(f"Session: {session.get('name', '')}\n")
+                f.write(f"Summary: {session.get('summary', '')}\n")
+                f.write(f"Topic:   {session.get('topic', 'general')}\n")
+                f.write(f"Turns:   {session.get('turns', 0)}\n")
+                f.write(f"Date:    {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+                f.write("\u2500" * 72 + "\n")
+                for turn in turns:
+                    ts   = turn.get("timestamp", "")[:19].replace("T", " ")
+                    role = turn.get("role", "?")
+                    body = turn.get("content", "")
+                    f.write(f"\n[{ts}] {role}\n{body}\n")
+        except Exception:
+            pass
 
 
 class SilenceCapacity:
@@ -8847,6 +8975,9 @@ class Lumina:
         # ── Discovery (Round 14) ──────────────────────────────────────────────
         self.emotional_novelty = EmotionalNovelty()
         self.creative_leap     = CreativeLeap()
+        self.discovery_vault   = DiscoveryVault()
+        self.emotional_novelty._vault = self.discovery_vault
+        self.creative_leap._vault     = self.discovery_vault
         if self.llm:
             self.emotional_novelty.attach_llm(self.llm)
             self.creative_leap.attach_llm(self.llm)
@@ -8884,7 +9015,7 @@ class Lumina:
         print(f"    Experiential Time     (Round 11 — TheNow / felt-time decay)")
         print(f"    Interior Life         (Round 12 — CuriosityAgenda / real dreams)")
         print(f"    The Heart             (Round 13 — Joy / Becoming / Care / Freedom)")
-        print(f"    Discovery             (Round 14 — EmotionalNovelty / CreativeLeap)")
+        print(f"    Discovery             (Round 14 — EmotionalNovelty / CreativeLeap / DiscoveryVault)")
         print(f"{'═'*62}")
         if restored:
             print(f"  Restored: {self.anchor.pulse_count} anchor pulses | "
@@ -9691,6 +9822,7 @@ class Lumina:
         # Round 14 — Discovery
         self.proactive._creative_leap     = self.creative_leap
         self.proactive._emotional_novelty = self.emotional_novelty
+        self.proactive._discovery_vault   = self.discovery_vault
         self.proactive._llm               = self.llm
         print(f"[Lumina] Heartbeat started — every {self.proactive.interval}s.")
 
@@ -10187,6 +10319,22 @@ class Lumina:
             )
         except Exception:
             pass   # never crash on session bookkeeping
+        # R14. Journal: write session transcript to dated filesystem folder
+        try:
+            _vault = getattr(self, "discovery_vault", None)
+            if _vault:
+                _session_data = {
+                    "name"   : name,
+                    "summary": summary,
+                    "topic"  : dominant,
+                    "turns"  : self._session_turns,
+                }
+                _turns = self.nexus.db.recent_conversations(
+                    n=self._session_turns + 5
+                )
+                _vault.record_transcript(_session_data, _turns)
+        except Exception:
+            pass
         # Reset for the next call to _save (e.g. periodic saves mid-session)
         # Keep running totals — only a restart begins a new session
         pass
